@@ -134,9 +134,10 @@ def hline(img, x0, x1, y):
         put(img, x, y, BLACK)
 
 
-def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30", icon=0):
+def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30", icon=0,
+                 city="上海"):
     img = canvas()
-    cn(img, 8, 2, "上海")
+    cn(img, 8, 2, city)
     asc(img, W - 8 - 40, 2, date)
     clock_text(img, (W - 5 * 16) // 2, 20, clock)
     hline(img, 6, W - 7, 47)
@@ -158,15 +159,16 @@ def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30
     return img
 
 
-def page_nonet(title="无网络"):
+def page_nonet(title="无网络", city="上海"):
     img = canvas()
+    cn(img, 8, 2, city)
     b, r = ICONS["NONET"]
     dual(img, 52, 22, b, r, 48, 48)
     w = len(title) * 16
     cn(img, (W - w) // 2, 80, title)
     hline(img, 46, 105, 104)
-    w = len("按任意键重试") * 16
-    cn(img, (W - w) // 2, 116, "按任意键重试")
+    w = len("按任意键切换城市") * 16
+    cn(img, (W - w) // 2, 116, "按任意键切换城市")
     return img
 
 
@@ -199,11 +201,13 @@ def page_provisioning(ap_ssid="NetEink-A1B2", ap_pass="12345678"):
 
 def main():
     items = [
-        ("weather 6deg sunny", page_weather(6, 12, 5, "晴", "11/22", "08:15", 0)),
-        ("weather -3deg cloudy", page_weather(-3, 4, -7, "多云", "12/03", "14:30", 1)),
-        ("weather rain 28deg", page_weather(28, 31, 24, "小雨", "07/18", "21:45", 3)),
-        ("no network", page_nonet("无网络")),
-        ("fetch failed", page_nonet("获取失败")),
+        ("weather 上海 6deg sunny", page_weather(6, 12, 5, "晴", "11/22", "08:15", 0, "上海")),
+        ("weather 南京 -3deg cloudy", page_weather(-3, 4, -7, "多云", "12/03", "14:30", 1, "南京")),
+        ("weather 西宁 3deg overcast", page_weather(3, 9, -1, "阴", "11/22", "19:05", 2, "西宁")),
+        ("weather 深圳 26deg rain", page_weather(26, 29, 22, "小雨", "11/22", "21:45", 3, "深圳")),
+        ("weather 玉树 -8deg snow", page_weather(-8, 2, -14, "小雪", "11/22", "23:10", 4, "玉树")),
+        ("no network", page_nonet("无网络", "上海")),
+        ("fetch failed", page_nonet("获取失败", "南京")),
         ("provisioning qr", page_provisioning()),
     ]
 
@@ -215,7 +219,7 @@ def main():
                               rows * cell_h + (rows + 1) * gap), (245, 243, 238))
     d = ImageDraw.Draw(sheet)
     try:
-        font = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 13)
+        font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 13)
     except Exception:
         font = ImageFont.load_default()
 

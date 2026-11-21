@@ -204,6 +204,21 @@ void Epd::DisplayFrame(const unsigned char* frame_buffer_black, const unsigned c
     // 标记「这是画面刷新等待」，回调据此切换指示灯动画
     refreshing = true;
     SendCommand(DISPLAY_REFRESH);
+
+    // DISPLAY_REFRESH 发出后，BUSY 要过几毫秒才真正拉低。原厂代码直接进
+    // WaitUntilIdle() 的 while，有可能一次都不进就返回：上层会误判「刷完了」
+    // ——指示灯提前变绿/熄灭、15 分钟定时器提前排好，而屏幕其实还在刷。
+    // 这里先等 BUSY 拉低（最多 300ms，期间照常喂指示灯动画）。
+    const unsigned long ASSERT_TIMEOUT_MS = 300;
+    const unsigned long t_assert = millis();
+    while (DigitalRead(busy_pin) != 0 &&
+           millis() - t_assert < ASSERT_TIMEOUT_MS) {
+        if (busy_cb != nullptr) {
+            busy_cb(millis() - t_assert, refreshing);
+        }
+        DelayMs(10);
+    }
+
     WaitUntilIdle();
     refreshing = false;
 }

@@ -1,8 +1,8 @@
 /**
- *  墨水屏天气牌（时钟 + 上海天气）—— 自画 ESP32-S2 板
+ *  墨水屏天气牌（时钟 + 五城天气）—— 自画 ESP32-S2 板
  * ----------------------------------------------------------------------------
  *  流程：
- *    上电 -> 连 WiFi -> NTP 对时 -> 拉上海天气
+ *    上电 -> 连 WiFi -> NTP 对时 -> 拉当前城市天气（上海/南京/西宁/深圳/玉树）
  *         -> 绘制 152x152 三色界面 -> 刷新
  *         -> 之后每 15 分钟（对齐 :00/:15/:30/:45）对时 + 拉天气 + 刷屏
  *      |             |
@@ -10,12 +10,14 @@
  *      +-- 成功：顶部城市/日期/时间，左侧天气图标，右侧大号温度，底部高低温
  *
  *  按键（KEY1/GPIO1、KEY2/GPIO2，任意一个）：
- *    短按 -> 立即刷新（断网会自动重连；天气失败保留上一份数据）
- *    长按 1.5s -> 强制重连 WiFi 后刷新
+ *    短按 -> 切到下一个预置城市（上海->南京->西宁->深圳->玉树->上海）并立即刷新
+ *    长按 1.5s -> 强制重连 WiFi 后刷新当前城市
+ *    城市索引存 NVS，重启后保持上次选的城
  *
  *  指示灯：板载 WS2812(GPIO9)，连续呼吸（见 rgb_led.h），不是硬开关闪烁
- *    蓝色慢呼吸 = 联网/对时/取天气   红色呼吸 = 刷屏中
- *    绿色慢呼吸 = 配网等待扫码       绿色浅呼吸 2.5s = 本轮刷新完成
+ *    蓝色 3.0s = 联网/对时/取天气     红色 4.0s = 刷屏中（15~20s 全程呼吸）
+ *    绿色 3.2s = 配网等待扫码         绿色浅呼吸 2.4s = 本轮刷新完成
+ *    周期 / 峰值 / 余光下限都在 src/rgb_led.cpp 的 kPresets[] 一张表里
  *
  *  屏幕：微雪 1.54inch e-Paper (C)，152x152，黑/白/红三色
  *  素材：src/ui_assets.h 由 tools/gen_ui_assets.py 生成（改字/改图重跑脚本）
@@ -29,6 +31,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
@@ -45,7 +48,7 @@
  * ==========================================================================*/
 
 // 上海 city code = 101020100；这个接口免 key、走 HTTP，S2 上没有 TLS 内存压力
-#define WEATHER_URL            "http://t.weather.itboy.net/api/weather/city/101020100"
+#define WEATHER_BASE           "http://t.weather.itboy.net/api/weather/city/"
 
 #define AP_PASSWORD            "12345678"   // 配网热点密码（WPA2 至少 8 位）
 
@@ -299,6 +302,40 @@ static void formatDate(char* out, size_t n) {
 }
 
 /* ============================================================================
+ * 预置城市：短按按键按表循环切换，索引存 NVS("ui"/"city")，掉电不丢
+ * code 是天气接口的城市编号（响应里的 cityInfo.citykey）
+ * ==========================================================================*/
+struct City {
+    const char* name;
+    const char* code;
+};
+
+static const City CITIES[] = {
+    {"上海", "101020100"},
+    {"南京", "101190101"},
+    {"西宁", "101150101"},
+    {"深圳", "101280601"},
+    {"玉树", "101150601"},
+};
+static const int CITY_COUNT = (int)(sizeof(CITIES) / sizeof(CITIES[0]));
+static int g_cityIdx = 0;
+
+static void loadCity() {
+    Preferences p;
+    if (!p.begin("ui", true)) return;      // 命名空间还不存在：沿用默认（上海）
+    const int idx = p.getInt("city", 0);
+    p.end();
+    if (idx >= 0 && idx < CITY_COUNT) g_cityIdx = idx;
+}
+
+static void saveCity() {
+    Preferences p;
+    if (!p.begin("ui", false)) return;
+    p.putInt("city", g_cityIdx);
+    p.end();
+}
+
+/* ============================================================================
  * 天气数据
  * ==========================================================================*/
 struct Weather {
@@ -306,6 +343,7 @@ struct Weather {
     int  temp  = 0;
     int  high  = 0;
     int  low   = 0;
+    char city[12] = "上海";
     char type[24] = "多云";
     char date[8]  = "--/--";
 };
@@ -350,10 +388,15 @@ static bool connectWiFi(const String& ssid, const String& pass) {
 }
 
 static bool fetchWeather(Weather& w) {
+    const City& city = CITIES[g_cityIdx];
+    char url[80];
+    snprintf(url, sizeof(url), WEATHER_BASE "%s", city.code);
+    logf("[HTTP] 请求 %s (%s)\n", city.name, city.code);
+
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setConnectTimeout(HTTP_TIMEOUT_MS);
-    if (!http.begin(WEATHER_URL)) {
+    if (!http.begin(url)) {
         logLine("[HTTP] begin 失败");
         return false;
     }
@@ -397,7 +440,9 @@ static bool fetchWeather(Weather& w) {
     }
 
     w.valid = true;
-    logf("[HTTP] %s %d度 高%d 低%d %s\n", w.date, w.temp, w.high, w.low, w.type);
+    strncpy(w.city, city.name, sizeof(w.city) - 1);
+    logf("[HTTP] %s %s %d度 高%d 低%d %s\n",
+         city.name, w.date, w.temp, w.high, w.low, w.type);
     return true;
 }
 
@@ -422,7 +467,7 @@ static void pageWeather(const Weather& w) {
     canvasClear();
 
     // 顶部：城市 + 日期（日期取本地时间，与时钟同源，不依赖天气接口）
-    drawCnText(8, 2, "上海", INK_BLACK);
+    drawCnText(8, 2, w.city, INK_BLACK);
     char date[8];
     formatDate(date, sizeof(date));
     drawAsciiText(EPD_WIDTH - 8 - 40, 2, date, INK_BLACK);
@@ -465,10 +510,12 @@ static void pageWeather(const Weather& w) {
 
 static void pageNoNet(const char* title) {
     canvasClear();
+    // 顶部照旧显示当前城市：离线/取数失败时也能确认按键切到了哪一座
+    drawCnText(8, 2, CITIES[g_cityIdx].name, INK_BLACK);
     drawDual(52, 22, ICONS[8].black, ICONS[8].red, 48, 48);   // 断网图标
     drawCnCenter(80, title, INK_BLACK);
     hLine(46, 105, 104, INK_BLACK);
-    drawCnCenter(116, "按任意键重试", INK_BLACK);
+    drawCnCenter(116, "按任意键切换城市", INK_BLACK);
 }
 
 /**
@@ -511,17 +558,33 @@ static bool pageProvisioning(const char* apSsid, const char* apPass) {
 /* ============================================================================
  * 刷新与指示灯
  * ==========================================================================*/
+static uint32_t g_epdTicks = 0;     // 刷屏等待期间推进了几帧呼吸（诊断用）
+
 static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
-    // 等待循环里约每 20ms 调一次：只切状态 + 推进波形，亮度由引擎自己算
-    rgbSetMode(refreshing ? RGB_WORK : RGB_WAIT);
+    // 等待循环里约每 20ms 调一次，只做两件事：进入刷屏状态、推进波形。
+    // 这里不再「非刷屏就切回 WAIT」——那会让状态在 Init()/Sleep() 的等待里
+    // 被反复改写，指示灯颜色来回跳；恢复哪种颜色交给调用方决定。
+    if (refreshing) {
+        rgbSetMode(RGB_WORK);
+        g_epdTicks++;
+    }
     rgbTick();
 }
 
+/**
+ * 刷屏：整个过程 15~20 秒，期间 LED 由 WaitUntilIdle 的回调持续推进波形。
+ * 进入前显式切到 RGB_WORK，不依赖回调是否被调用——即使 BUSY 引脚异常、
+ * 回调一帧都没跑，指示灯也至少是「红色呼吸」，不会突然变绿或熄灭。
+ */
 static void refreshScreen() {
     logLine("[EPD] 刷新中 ...");
+    rgbSetMode(RGB_WORK);
+    g_epdTicks = 0;
     const uint32_t t0 = millis();
     g_epd.DisplayFrame(g_black, g_red);
-    logf("[EPD] 完成，耗时 %lu ms\n", (unsigned long)(millis() - t0));
+    const uint32_t dt = millis() - t0;
+    logf("[EPD] 完成，耗时 %lu ms，呼吸 %lu 帧\n",
+         (unsigned long)dt, (unsigned long)g_epdTicks);
 }
 
 /**
@@ -600,7 +663,8 @@ static void drawAndRefresh() {
 
 /**
  * 整屏刷新：联网 -> 对时 -> 拉天气 -> 绘制 -> 刷屏。
- * forceNet=true（长按）先断开再重连；否则只在掉线时重连。
+ * 现在只有 15 分钟定时器会调它（按键已空实现）；forceNet=true 是先断开再重连，
+ * 目前没有调用方，留给以后的手动重连用。
  * 天气拉取失败保留上一份数据，不会把已有页面变成错误页。
  */
 static void refreshAll(bool forceNet) {
@@ -628,7 +692,8 @@ static void refreshAll(bool forceNet) {
 }
 
 /* ============================================================================
- * 按键
+ * 按键：短按切城市 / 长按重连
+ * 消抖 + 长短按识别在这里，动作在 handleButtons() 里派发
  * ==========================================================================*/
 enum BtnEvent { BTN_NONE = 0, BTN_SHORT, BTN_LONG };
 
@@ -672,6 +737,32 @@ static BtnEvent pollButton(Button& b) {
     return BTN_NONE;
 }
 
+/**
+ * 按键：短按（任一键）切到下一个城市并立即刷新；长按强制重连后刷新当前城市。
+ * 城市索引写 NVS，重启后仍停在上次选的城。
+ */
+static void cycleCity() {
+    g_cityIdx = (g_cityIdx + 1) % CITY_COUNT;
+    saveCity();
+    g_weather.valid = false;      // 先作废旧城数据，别把上海的温度挂到南京名下
+    logf("[UI] 切换城市 -> %s (%s)\n",
+         CITIES[g_cityIdx].name, CITIES[g_cityIdx].code);
+    refreshAll(false);            // 联网 -> 拉新城天气 -> 重绘
+}
+
+static void handleButtons() {
+    const BtnEvent evA = pollButton(g_btnA);
+    const BtnEvent evB = pollButton(g_btnB);
+    const BtnEvent ev  = (evA != BTN_NONE) ? evA : evB;
+
+    if (ev == BTN_SHORT) {
+        cycleCity();
+    } else if (ev == BTN_LONG) {
+        logLine("[UI] 长按：强制重连并刷新");
+        refreshAll(true);
+    }
+}
+
 /* ============================================================================
  * 主流程
  * ==========================================================================*/
@@ -684,8 +775,11 @@ void setup() {
     pinMode(PIN_BTN_A, INPUT_PULLUP);
     pinMode(PIN_BTN_B, INPUT_PULLUP);
 
+    loadCity();                     // 恢复上次选的城市（NVS），没存过就是上海
+
     logLine("\n========================================");
-    logLine("  NetEink / 时钟 + 上海天气");
+    logLine("  NetEink / 时钟 + 天气");
+    logf("  城市：%s (短按切换)\n", CITIES[g_cityIdx].name);
     logLine("========================================");
 
     g_epd.SetBusyCallback(onBusyTick);
@@ -738,7 +832,7 @@ void setup() {
     logLine("[5/5] 绘制并刷新 ...");
     drawAndRefresh();
 
-    logLine("[提示] 短按立即刷新，长按强制重连");
+    logLine("[提示] 短按切换城市，长按强制重连");
 }
 
 void loop() {
@@ -749,18 +843,8 @@ void loop() {
     }
     rgbTick();
 
-    // 任意一个按键：短按 -> 立即刷新；长按 -> 强制重连 WiFi 后刷新
-    const BtnEvent evA = pollButton(g_btnA);
-    const BtnEvent evB = pollButton(g_btnB);
-    const BtnEvent ev  = (evA != BTN_NONE) ? evA : evB;
-
-    if (ev == BTN_SHORT) {
-        logLine("[UI] 短按：立即刷新");
-        refreshAll(false);
-    } else if (ev == BTN_LONG) {
-        logLine("[UI] 长按：强制重连并刷新");
-        refreshAll(true);
-    }
+    // 按键：空实现 —— 按下不做任何事，更不会刷屏
+    handleButtons();
 
     // 到点刷新：每 15 分钟，对齐 :00/:15/:30/:45
     if (g_planValid && (int32_t)(millis() - g_nextRefreshMs) >= 0) {

@@ -21,7 +21,7 @@ bool loadWifiCreds(String& ssid, String& pass) {
     // NVS 分区自检：返回非 0 说明分区未初始化或需要擦除重建
     const esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
-        Serial.printf("[NVS] flash_init 失败: %d (%s)\n", (int)err, esp_err_to_name(err));
+        Serial.printf("[NVS] flash_init 失败: %d (%s)\n", static_cast<int>(err), esp_err_to_name(err));
     }
 
     Preferences p;
@@ -49,7 +49,7 @@ void saveWifiCreds(const String& ssid, const String& pass) {
     const size_t n2 = p.putString("pass", pass);
     p.end();                                     // end() 里才真正 commit
     Serial.printf("[NVS] 写入 ssid=%u 字节, pass=%u 字节\n",
-                  (unsigned)n1, (unsigned)n2);
+                  static_cast<unsigned>(n1), static_cast<unsigned>(n2));
 }
 
 void clearWifiCreds() {
@@ -141,7 +141,7 @@ fetch('/scan').then(function (r) { return r.json(); }).then(function (aps) {
 )rawliteral";
 
 /* 保存后的过渡页：每秒轮询 /status，实时显示连接结果，不再依赖重启 */
-static const char PAGE_CONNECTING[] = R"rawliteral(
+static constexpr char PAGE_CONNECTING[] = R"rawliteral(
 <!DOCTYPE html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8">
@@ -246,7 +246,7 @@ static void handleStatus() {
 void startProvisioning(const String& apSsid, const String& apPass) {
     // 用 AP+STA 共存模式：保存后可以直接 WiFi.begin() 连新网络，
     // 不必先关热点再切模式 —— 那一步在 S2 上容易把射频卡死。
-    WiFi.mode(WIFI_AP_STA);
+    WiFiClass::mode(WIFI_AP_STA);
     WiFi.softAP(apSsid.c_str(), apPass.c_str());
     delay(200);
 
