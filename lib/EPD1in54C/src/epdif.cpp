@@ -76,10 +76,20 @@ int EpdIf::IfInit(void) {
     //    AVR 的 SPI 引脚是芯片固定的，SPI.begin() 不需要参数；
     //    S2 上不带参数会用 FSPI 默认 (SCK=36, MISO=37, MOSI=35, SS=34)，
     //    与本板原理图接线完全不同，所以必须把 epdif.h 里的引脚显式传进来。
+    // 4) SPI 总线只配置一次。
+    //    beginTransaction() 会拿一把非递归互斥锁（SPI_PARAM_LOCK），而这里
+    //    故意不配对 endTransaction（原厂做法，长期持有事务），所以第二次
+    //    beginTransaction() 会在同一个任务上自死锁。
+    //    屏幕现在是 Init -> Display -> Sleep 循环，每次刷新都会走 Init()，
+    //    因此必须用静态标志把这段挡在第一次。
+    static bool spi_ready = false;
+    if (spi_ready) return 0;
+
     SPI.begin(EPD_SCK_PIN, EPD_MISO_PIN, EPD_MOSI_PIN, EPD_CS_PIN);
 
-    // 4) 电子纸用 SPI MODE0 / MSB first / 2MHz。
-    //    只 begin 一次并长期持有事务（原厂做法），不要每字节配对 endTransaction。
+    // 电子纸用 SPI MODE0 / MSB first / 2MHz。
+    // 只 begin 一次并长期持有事务，不要每字节配对 endTransaction。
     SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    spi_ready = true;
     return 0;
 }

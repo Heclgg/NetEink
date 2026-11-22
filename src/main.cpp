@@ -643,6 +643,7 @@ static bool pageLink(const char* url, bool forCity)
 /* ============================================================================
  * 刷新与指示灯
  * ==========================================================================*/
+static bool g_epdAsleep = false; // 面板已下电（刷完就关，见 refreshScreen）
 static uint32_t g_epdTicks = 0; // 刷屏等待期间推进了几帧灯（诊断用）
 
 static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
@@ -662,9 +663,27 @@ static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
 static void refreshScreen() {
     logLine("[EPD] refreshing ...");
     rgbOff();
+
+    // 上一帧刷完就下电了（见函数尾），面板在深睡状态不收命令，
+    // 必须先 Init()：里面有硬件复位 + POWER_ON，是唤醒面板的唯一途径。
+    // 少了这一步，第二次以后的刷新全部无效——屏幕不动，看起来像按键失灵。
+    if (g_epdAsleep)
+    {
+        g_epd.Init();
+        g_epdAsleep = false;
+    }
+
     g_epdTicks = 0;
     const uint32_t t0 = millis();
     g_epd.DisplayFrame(g_black, g_red);
+
+    // 刷完立刻下电（POWER_OFF + VCOM 归零）。
+    // 三色屏不能一直加着电：像素上持续有直流偏压，红色粒子会慢慢迁移，
+    // 放几个小时整屏就泛红。墨水屏是双稳态的，断电后画面照样留着，
+    // 所以每次刷完都 Sleep()，下次刷新前 Init() 会硬件复位重新上电。
+    g_epd.Sleep();
+    g_epdAsleep = true;
+
     const uint32_t dt = millis() - t0;
     logf("[EPD] done in %lu ms, %lu led frames\n",
          (unsigned long)dt, (unsigned long)g_epdTicks);
@@ -992,7 +1011,12 @@ static void enterDeepSleep()
         logf("[PWR] timer wake in %lu s\n", (unsigned long)(waitMs / 1000));
 
     if (g_mode == UI_LINK) photoServerStop(); // 正常进不来，保险
-    g_epd.Sleep(); // 面板断电，画面留着
+    if (!g_epdAsleep)
+    {
+        // 正常路径刷完就已经下电了
+        g_epd.Sleep();
+        g_epdAsleep = true;
+    }
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 
@@ -1058,6 +1082,7 @@ void setup() {
         logLine("[EPD] init failed: check SPI wiring / power");
         return;
     }
+    g_epdAsleep = false;
 
     // 2) 有凭据就联网；没配过网或连不上 -> 进配网（内部阻塞，连上后返回）
     String ssid, pass;
