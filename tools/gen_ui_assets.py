@@ -3,7 +3,7 @@
 """生成墨水屏 UI 资源头文件：中文点阵、大号数字、时钟数字、ASCII、天气图标。
 
 用法: python tools/gen_ui_assets.py [选项]
-输出: src/ui_assets.h
+输出: include/ui_assets.h
 
 屏幕只有白/黑/红三色，图标与图片先按 4x 超采样渲染出灰度过渡，
 再用三色 Floyd-Steinberg 误差扩散抖动成 1-bit 双层位图，曲线/斜边
@@ -15,17 +15,18 @@
   --ss N             超采样倍数，默认 4
   --strength F       误差扩散强度 0~1，默认 1.0（调小可减轻噪点）
   --compare [路径]   额外输出「抖动前 / 抖动后」放大对比图
-  --output 路径      指定头文件输出位置（默认 src/ui_assets.h）
+  --output 路径      指定头文件输出位置（默认 include/ui_assets.h）
 
 改动字库或图片后重跑本脚本即可，main.cpp 不需要动。
 """
 import argparse
+import json
 import math
 import os
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "src", "ui_assets.h")
+OUT = os.path.join(ROOT, "include", "ui_assets.h")
 
 FONT_CN = r"C:\Windows\Fonts\simhei.ttf"
 FONT_NUM = r"C:\Windows\Fonts\arialbd.ttf"
@@ -36,7 +37,26 @@ BLACK = (0, 0, 0)
 RED = (200, 30, 30)
 WHITE = (255, 255, 255)
 
-CN_CHARS = "上海晴多云阴小中大雨雪夹雾霾风沙尘浮扬无网络最高低天气获取失败按任意键重试扫码配网后点加入南京西宁深圳玉树城市切换"
+CN_CHARS = ("上海晴多云阴小中大雨雪夹雾霾风沙尘浮扬无网络最高低天气获取失败"
+            "按任意键重试扫码配网后点加入南京西宁深圳玉树城市切换传图设置正在使用定位")
+
+
+def load_city_chars():
+    """城市名用字：从 tools/data/cities.json 取，保证列表里任意城市都能上屏。
+
+    353 个城市名去重后约 380 字，每个 16x16 字模 32 字节，合计约 12KB。
+    """
+    path = os.path.join(ROOT, "tools", "data", "cities.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return "".join(c["n"] for c in data["cities"])
+    except (OSError, KeyError, ValueError) as e:
+        print("  [警告] 读不到城市数据（%s），城市名可能显示不全" % e)
+        return ""
+
+
+CN_CHARS += load_city_chars()
 
 W = H = 152                 # 页面逻辑尺寸（超采样前的坐标系）
 
@@ -507,7 +527,7 @@ def main():
     out.append("")
 
     # ASCII 8x16
-    ascii_chars = "0123456789/:. -"
+    ascii_chars = "0123456789/:. -%"  # % 给电池百分比用，追加在末尾不打乱已有下标
     out.append("// 8x16 ASCII，每行 1 字节")
     for i, ch in enumerate(ascii_chars):
         bmp = pack_mono(render_glyph(ch, 13, FONT_ASCII, 8, 16), 8, 16)
@@ -540,7 +560,7 @@ def main():
     out.append("")
 
     text = "\n".join(out) + "\n"
-    with open(args.output, "w", encoding="utf-8", newline="\n") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         f.write(text)
     print("写入 %s (%d 字节)" % (args.output, len(text.encode("utf-8"))))
 

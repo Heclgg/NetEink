@@ -7,6 +7,7 @@
 #include <esp_mac.h>
 #include <nvs_flash.h>
 
+#include "log.h"
 #include "rgb_led.h"
 
 static WebServer g_server(80);
@@ -21,35 +22,35 @@ bool loadWifiCreds(String& ssid, String& pass) {
     // NVS 分区自检：返回非 0 说明分区未初始化或需要擦除重建
     const esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
-        Serial.printf("[NVS] flash_init 失败: %d (%s)\n", static_cast<int>(err), esp_err_to_name(err));
+        logf("[NVS] flash_init failed: %d (%s)\n", static_cast<int>(err), esp_err_to_name(err));
     }
 
     Preferences p;
     // 用读写模式打开：命名空间不存在时会自动创建，
     // 只读模式（true）在首次配网前必然失败。
     if (!p.begin(NVS_NS, false)) {
-        Serial.printf("[NVS] begin 失败: %s\n", esp_err_to_name(err));
+        logf("[NVS] begin failed: %s\n", esp_err_to_name(err));
         return false;
     }
     ssid = p.getString("ssid", "");
     pass = p.getString("pass", "");
     p.end();
-    Serial.printf("[NVS] 读出 ssid=\"%s\" (%u 字节), pass %u 字节\n",
-                  ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
+    logf("[NVS] read ssid=\"%s\" (%u bytes), pass %u bytes\n",
+         ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
     return ssid.length() > 0;
 }
 
 void saveWifiCreds(const String& ssid, const String& pass) {
     Preferences p;
     if (!p.begin(NVS_NS, false)) {
-        Serial.println("[NVS] begin 失败，凭据没有保存");
+        logLine("[NVS] begin failed, credentials not saved");
         return;
     }
     const size_t n1 = p.putString("ssid", ssid);
     const size_t n2 = p.putString("pass", pass);
     p.end();                                     // end() 里才真正 commit
-    Serial.printf("[NVS] 写入 ssid=%u 字节, pass=%u 字节\n",
-                  static_cast<unsigned>(n1), static_cast<unsigned>(n2));
+    logf("[NVS] saved ssid=%u bytes, pass=%u bytes\n",
+         static_cast<unsigned>(n1), static_cast<unsigned>(n2));
 }
 
 void clearWifiCreds() {
@@ -224,8 +225,8 @@ static void handleSave() {
         g_server.send(400, "text/plain", "SSID 不能为空");
         return;
     }
-    Serial.printf("[AP] 收到 ssid=\"%s\" (长度 %u), pass 长度 %u\n",
-                  ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
+    logf("[AP] got ssid=\"%s\" (len %u), pass len %u\n",
+         ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
     saveWifiCreds(ssid, pass);
 
     g_pendingSsid = ssid;
@@ -251,8 +252,8 @@ void startProvisioning(const String& apSsid, const String& apPass) {
     delay(200);
 
     const IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[AP] 热点 %s / %s  IP=%s\n",
-                  apSsid.c_str(), apPass.c_str(), ip.toString().c_str());
+    logf("[AP] ssid %s / pass %s  IP=%s\n",
+         apSsid.c_str(), apPass.c_str(), ip.toString().c_str());
 
     g_dns.start(53, "*", ip);
 
@@ -275,9 +276,9 @@ bool runProvisioning() {
 
         if (g_saveState == 1) {
             g_saveState = 2;
-            Serial.printf("[AP] 连接 %s ...\n", g_pendingSsid.c_str());
+            logf("[AP] connecting %s ...\n", g_pendingSsid.c_str());
             WiFi.begin(g_pendingSsid.c_str(), g_pendingPass.c_str());
-            rgbSetMode(RGB_WAIT);             // 正在连用户给的新网络：蓝呼吸
+            // 灯保持橙色不动：此刻仍然是「配网中，等你/等路由」的同一件事
 
             const uint32_t t0 = millis();
             while (millis() - t0 < 20000) {
@@ -285,23 +286,23 @@ bool runProvisioning() {
                 g_server.handleClient();
                 if (WiFi.status() == WL_CONNECTED) {
                     g_saveState = 3;
-                    Serial.printf("[AP] 连接成功 %s\n",
-                                  WiFi.localIP().toString().c_str());
+                    logf("[AP] connected %s\n",
+                         WiFi.localIP().toString().c_str());
                     break;
                 }
-                rgbTick();                    // 20s 等待期间呼吸不能停
+                rgbTick(); // 20s 等待期间灯的倒计时不能停
                 delay(20);
             }
             if (g_saveState != 3) {
                 g_saveState = 4;
-                Serial.printf("[AP] 连接失败 status=%d\n", (int)WiFi.status());
+                logf("[AP] connect failed status=%d\n", (int)WiFi.status());
                 WiFi.disconnect();
-                rgbSetMode(RGB_CONFIG);       // 失败：回到绿色慢呼吸继续等
+                // 连不上就继续等下一次提交（灯早闪完熄了，屏上二维码还在）
             }
         }
 
         if (g_saveState == 3) {
-            // 让页面有机会轮询到「成功」，期间继续推呼吸灯
+            // 让页面有机会轮询到「成功」，期间继续推灯
             const uint32_t t0 = millis();
             while (millis() - t0 < 2000) {
                 rgbTick();
@@ -310,7 +311,7 @@ bool runProvisioning() {
             g_server.stop();
             g_dns.stop();
             WiFi.softAPdisconnect(true);      // 关热点，把射频让给 STA
-            Serial.println("[AP] 配网完成，关闭热点");
+            logLine("[AP] provisioning done, stop AP");
             return true;
         }
 

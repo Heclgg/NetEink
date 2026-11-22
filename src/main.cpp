@@ -1,44 +1,68 @@
 /**
- *  墨水屏天气牌（时钟 + 五城天气）—— 自画 ESP32-S2 板
+ *  墨水屏天气牌（时钟 + 任意城市天气）—— 自画 ESP32-S2 板
+ *  文件：src/*.cpp 是实现，include/*.h 是声明（含脚本生成的 include/ui_assets.h、
+ *        include/cities_data.h）
  * ----------------------------------------------------------------------------
  *  流程：
- *    上电 -> 连 WiFi -> NTP 对时 -> 拉当前城市天气（上海/南京/西宁/深圳/玉树）
+ *    上电 -> 连 WiFi -> NTP 对时 -> 拉当前城市天气（默认上海，可换 352 个城市）
  *         -> 绘制 152x152 三色界面 -> 刷新
  *         -> 之后每 15 分钟（对齐 :00/:15/:30/:45）对时 + 拉天气 + 刷屏
  *      |             |
  *      |             +-- 失败：断网图标 + "无网络"，时间显示 --:--
  *      +-- 成功：顶部城市/日期/时间，左侧天气图标，右侧大号温度，底部高低温
  *
- *  按键（KEY1/GPIO1、KEY2/GPIO2，任意一个）：
- *    短按 -> 切到下一个预置城市（上海->南京->西宁->深圳->玉树->上海）并立即刷新
- *    长按 1.5s -> 强制重连 WiFi 后刷新当前城市
- *    城市索引存 NVS，重启后保持上次选的城
+ *  换城市：手机上选，见 include/city.h
+ *    短按        -> 开设置页：屏上二维码，手机扫码后可选城市 / 用当前位置自动定位
+ *    选完自动回天气页并刷新；城市编号存 NVS，重启后保持
+ *    城市表 352 个（中国天气网编号 + 经纬度），按 IP 定位时就近匹配
  *
- *  指示灯：板载 WS2812(GPIO9)，连续呼吸（见 rgb_led.h），不是硬开关闪烁
- *    蓝色 3.0s = 联网/对时/取天气     红色 4.0s = 刷屏中（15~20s 全程呼吸）
- *    绿色 3.2s = 配网等待扫码         绿色浅呼吸 2.4s = 本轮刷新完成
- *    周期 / 峰值 / 余光下限都在 src/rgb_led.cpp 的 kPresets[] 一张表里
+ *  按键（KEY1/GPIO1、KEY2/GPIO2）：
+ *    长按 KEY1   -> 扫码传图：屏幕显示二维码，手机扫码上传照片；再长按 KEY1 退出
+ *                   同一个网页里也能设城市，只是入口不同（扫码后自动滚到对应区块）
+ *    长按 KEY2   -> 直接重放上一次传的图（存在 Flash 里，不联网、不用手机）；
+ *                   还没传过图时和长按 KEY1 一样，落到扫码页；
+ *                   屏上已经是照片时长按 = 回天气页（不重复刷同一张）
+ *    看图页 / 设置页里短按不响应，避免误触把照片刷掉
+ *
+ *  传图：内置网页（src/photo_server.cpp），裁剪/缩放/三色抖动都在手机端完成，
+ *        设备只收 5776 字节的双层点阵，不占 RAM 也不需要 JPEG 解码器。
+ *        传图时暂停 15 分钟定时刷新，照片一直留在屏上，直到长按退出。
+ *        收到的图会另存一份到 Flash（src/photo_store.cpp），断电也不丢，
+ *        长按 KEY2 就能调出来，当电子相框用。
+ *
+ *  指示灯：板载 WS2812(GPIO9)，只有两种状态亮灯，其余一律熄灭（见 include/rgb_led.h）
+ *    绿色闪三下 = 图片已经刷到屏上（传图成功 / 长按 KEY2 重放）
+ *    橙色闪三下 = 配网二维码已就绪，等手机提交
+ *    都是闪完就熄，不常亮
+ *    刷屏中 / 联网 / 对时 / 取天气 / 天气页刷新：都不亮
+ *    颜色 / 周期 / 余光下限都在 src/rgb_led.cpp 的 kPresets[] 一张表里
  *
  *  屏幕：微雪 1.54inch e-Paper (C)，152x152，黑/白/红三色
- *  素材：src/ui_assets.h 由 tools/gen_ui_assets.py 生成（改字/改图重跑脚本）
+ *  素材：include/ui_assets.h 由 tools/gen_ui_assets.py 生成（改字/改图重跑脚本）
  *        图标/图片在生成端已做 4x 超采样 + 白/黑/红三色误差扩散抖动，
  *        用点阵疏密模拟中间调，边缘/渐变更顺滑；落到屏上仍是 1-bit 双层
  *        位图，MCU 端没有灰度可还原，所以这里只直出、不再抖动。
  *        字模保持硬阈值二值化，避免笔画被抖动打毛。
- *  日志：USB CDC(COM9) 与 UART0(GPIO43/44) 双路输出
+ *  日志：USB CDC(COM9) 与 UART0(GPIO43/44) 双路输出，见 include/log.h
+ *        构建：pio run = 调试版（日志全开）
+ *              pio run -e release = 发布版（日志与格式串全部编译掉，省 63KB Flash）
  */
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
 #include "epd1in54c.h"
+#include "log.h"
 #include "ui_assets.h"
+#include "city.h"
+#include "battery.h"
 #include "qrcode.h"
 #include "provisioning.h"
+#include "photo_server.h"
+#include "photo_store.h"
 #include "rgb_led.h"
 
 /* ============================================================================
@@ -61,40 +85,26 @@
 #define BOARD_RGB_PIN              9
 #endif
 #ifndef BOARD_RGB_PEAK
-#define BOARD_RGB_PEAK            96    // 呼吸峰值亮度 0-255：嫌亮就调小
+#define BOARD_RGB_PEAK            255    // 闪烁峰值亮度 0-255：嫌亮就调小
 #endif
 
 #define PIN_BTN_A                  1   // KEY1
 #define PIN_BTN_B                  2   // KEY2
 
 /* ============================================================================
- * 双路日志：USB CDC(COM9) + UART0(GPIO43/44)
+ * 日志：logf / logLine 见 log.h（双路输出，release 下编译为空）
  * ==========================================================================*/
-static void logf(const char* fmt, ...) {
-    char buf[224];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    Serial.print(buf);
-    Serial0.print(buf);
-}
-
-static void logLine(const char* s = "") {
-    Serial.println(s);
-    Serial0.println(s);
-}
 
 /* ============================================================================
- * 板载 WS2812（GPIO9）：呼吸波形在 rgb_led.cpp，这里只决定「什么状态什么颜色」
+ * 板载 WS2812（GPIO9）：波形与「闪几次」在 rgb_led.cpp，这里只决定什么状态什么颜色
+ * ----------------------------------------------------------------------------
+ * 只有两个状态亮灯，而且都是「需要你看一眼」的静止状态：
+ *   绿色 = 图片已经在屏上（传图成功 / 长按 KEY2 重放）
+ *   橙色 = 配网二维码已就绪，等手机提交凭据
+ * 刷屏期间（15~20s）、联网、对时、取天气、天气页定时刷新都不亮灯——
+ * 这些过程屏上本来就有变化，半夜里多一盏灯只会碍事。
+ * 熄灭走 rgbOff() 的淡出，约 0.38s 掉到全黑，不是硬切。
  * ==========================================================================*/
-#define LED_CONFIRM_MS  2500        // 刷新完成后绿色浅呼吸的保持时间
-static uint32_t g_ledOffAt = 0;     // 到点自动熄灭；0 = 没有待处理的熄灭
-
-static void ledConfirm(uint32_t holdMs = LED_CONFIRM_MS) {
-    rgbSetMode(RGB_OK);
-    g_ledOffAt = millis() + holdMs;
-}
 
 /* ============================================================================
  * 帧缓冲：黑白层 + 红色层，各 152*152/8 = 2888 字节
@@ -278,7 +288,7 @@ static void startClockSync() {
 static bool waitClock(uint32_t timeoutMs) {
     const uint32_t t0 = millis();
     while (!clockValid() && millis() - t0 < timeoutMs) {
-        rgbTick();                 // 对时要等好几秒，呼吸灯不能停
+        rgbTick(); // 对时要等好几秒，灯的倒计时要继续走
         delay(20);
     }
     return clockValid();
@@ -302,38 +312,9 @@ static void formatDate(char* out, size_t n) {
 }
 
 /* ============================================================================
- * 预置城市：短按按键按表循环切换，索引存 NVS("ui"/"city")，掉电不丢
- * code 是天气接口的城市编号（响应里的 cityInfo.citykey）
+ * 城市：表和「当前是哪个」都在 include/city.h / src/city.cpp 里
+ * 这里只管拉天气和往屏上画
  * ==========================================================================*/
-struct City {
-    const char* name;
-    const char* code;
-};
-
-static const City CITIES[] = {
-    {"上海", "101020100"},
-    {"南京", "101190101"},
-    {"西宁", "101150101"},
-    {"深圳", "101280601"},
-    {"玉树", "101150601"},
-};
-static const int CITY_COUNT = (int)(sizeof(CITIES) / sizeof(CITIES[0]));
-static int g_cityIdx = 0;
-
-static void loadCity() {
-    Preferences p;
-    if (!p.begin("ui", true)) return;      // 命名空间还不存在：沿用默认（上海）
-    const int idx = p.getInt("city", 0);
-    p.end();
-    if (idx >= 0 && idx < CITY_COUNT) g_cityIdx = idx;
-}
-
-static void saveCity() {
-    Preferences p;
-    if (!p.begin("ui", false)) return;
-    p.putInt("city", g_cityIdx);
-    p.end();
-}
 
 /* ============================================================================
  * 天气数据
@@ -343,7 +324,7 @@ struct Weather {
     int  temp  = 0;
     int  high  = 0;
     int  low   = 0;
-    char city[12] = "上海";
+    char city[16] = "上海";
     char type[24] = "多云";
     char date[8]  = "--/--";
 };
@@ -365,12 +346,36 @@ static int firstInt(const char* s) {
     return atoi(s);
 }
 
+#if NETEINK_LOG
+/**
+ * 天气类型 -> 串口里的英文词。
+ * 接口返回的是中文（"小雨"、"晴转多云"），串口只出英文，这里按键归类，
+ * 关键字和 pickIcon() 一致，日志和图标说的是同一件事。
+ * release 下所有日志被宏删掉，这个函数也跟着不编译，避免 unused 警告。
+ */
+static const char* weatherEn(const char* type)
+{
+    if (strstr(type, "雷")) return "thunder";
+    if (strstr(type, "雪")) return "snow";
+    if (strstr(type, "雨")) return "rain";
+    if (strstr(type, "雾") || strstr(type, "霾")) return "fog";
+    if (strstr(type, "风") || strstr(type, "沙") ||
+        strstr(type, "尘") || strstr(type, "扬"))
+        return "wind";
+    if (strstr(type, "阴")) return "overcast";
+    if (strstr(type, "多云")) return "cloudy";
+    if (strstr(type, "晴")) return "clear";
+    return "unknown";
+}
+#endif
+
 static bool connectWiFi(const String& ssid, const String& pass) {
-    logf("[WiFi] 连接 %s ...\n", ssid.c_str());
+    logf("[WiFi] connecting %s ...\n", ssid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), pass.c_str());
 
-    rgbSetMode(RGB_WAIT);              // 蓝色慢呼吸，替代原来的 250ms 硬闪
+    // 联网期间不亮灯（只在配网就绪/图已上屏这两个时刻闪三下），rgbTick 仍要推，
+    // 否则从配网橙色退出时会卡在半亮
     const uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
         rgbTick();
@@ -378,39 +383,38 @@ static bool connectWiFi(const String& ssid, const String& pass) {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        logf("[WiFi] 已连接 %s  RSSI=%d\n",
+        logf("[WiFi] connected %s  RSSI=%d\n",
              WiFi.localIP().toString().c_str(), WiFi.RSSI());
         return true;
     }
-    rgbOff();
-    logLine("[WiFi] 连接失败");
+    logLine("[WiFi] connect failed");
     return false;
 }
 
 static bool fetchWeather(Weather& w) {
-    const City& city = CITIES[g_cityIdx];
+    const CityRec& city = cityCurrent();
     char url[80];
-    snprintf(url, sizeof(url), WEATHER_BASE "%s", city.code);
-    logf("[HTTP] 请求 %s (%s)\n", city.name, city.code);
+    snprintf(url, sizeof(url), WEATHER_BASE "%09lu", (unsigned long)city.code);
+    logf("[HTTP] GET code %09lu\n", (unsigned long)city.code);
 
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setConnectTimeout(HTTP_TIMEOUT_MS);
     if (!http.begin(url)) {
-        logLine("[HTTP] begin 失败");
+        logLine("[HTTP] begin failed");
         return false;
     }
 
     const int code = http.GET();
     if (code != 200) {
-        logf("[HTTP] 状态码 %d\n", code);
+        logf("[HTTP] status %d\n", code);
         http.end();
         return false;
     }
 
     String body = http.getString();
     http.end();
-    logf("[HTTP] 收到 %u 字节\n", (unsigned)body.length());
+    logf("[HTTP] got %u bytes\n", (unsigned)body.length());
     if (body.length() < 100) return false;
 
     char buf[64];
@@ -425,7 +429,7 @@ static bool fetchWeather(Weather& w) {
     if (fc < 0) return false;
 
     if (extractQuoted(body, "type", w.type, sizeof(w.type), fc)) {
-        logf("[HTTP] 天气 %s\n", w.type);
+        logf("[HTTP] weather %s\n", weatherEn(w.type));
     }
     if (extractQuoted(body, "high", buf, sizeof(buf), fc)) {
         w.high = firstInt(buf);
@@ -441,8 +445,8 @@ static bool fetchWeather(Weather& w) {
 
     w.valid = true;
     strncpy(w.city, city.name, sizeof(w.city) - 1);
-    logf("[HTTP] %s %s %d度 高%d 低%d %s\n",
-         city.name, w.date, w.temp, w.high, w.low, w.type);
+    logf("[HTTP] %s  %dC  high %d  low %d  %s\n",
+         w.date, w.temp, w.high, w.low, weatherEn(w.type));
     return true;
 }
 
@@ -463,6 +467,36 @@ static int pickIcon(const char* type) {
 /* ============================================================================
  * 页面绘制
  * ==========================================================================*/
+static int g_batteryMv = 0;
+static int g_batteryPct = -1; // -1 = 还没采过
+
+/**
+ * 电池图标 + 百分比：右对齐到 right，纵向占 y..y+15（和一行 ASCII 同高）。
+ * 低于 15% 用红色——三色屏上这是最直接的「该充电了」。
+ */
+static void drawBattery(int right, int y, int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    const Ink ink = (pct <= 15) ? INK_RED : INK_BLACK;
+
+    char txt[8];
+    snprintf(txt, sizeof(txt), "%d%%", pct);
+    const int tw = (int)strlen(txt) * 8;
+
+    // 外壳 18x10 + 正极 2x4，与 16px 高的文字居中对齐
+    const int bx = right - tw - 6 - 20;
+    const int by = y + 3;
+    fillRect(bx, by, 18, 10, ink);
+    fillRect(bx + 1, by + 1, 16, 8, INK_WHITE);
+    fillRect(bx + 18, by + 3, 2, 4, ink);
+
+    const int w = (14 * pct + 50) / 100; // 内侧 14px 按比例填
+    if (w > 0) fillRect(bx + 2, by + 2, w, 6, ink);
+
+    drawAsciiText(right - tw, y, txt, ink);
+}
+
 static void pageWeather(const Weather& w) {
     canvasClear();
 
@@ -491,6 +525,9 @@ static void pageWeather(const Weather& w) {
     // 天气文字放在图标正下方，与图标成一组
     drawCnText(10 + 24 - cnWidth(w.type) / 2, 104, w.type, INK_BLACK);
 
+    // 电池：图标 + 百分比，右对齐在同一行的右端
+    if (g_batteryPct >= 0) drawBattery(146, 104, g_batteryPct);
+
     // 底部：最高 / 最低
     hLine(6, EPD_WIDTH - 7, 124, INK_BLACK);
 
@@ -510,12 +547,13 @@ static void pageWeather(const Weather& w) {
 
 static void pageNoNet(const char* title) {
     canvasClear();
-    // 顶部照旧显示当前城市：离线/取数失败时也能确认按键切到了哪一座
-    drawCnText(8, 2, CITIES[g_cityIdx].name, INK_BLACK);
+    // 顶部照旧显示当前城市：离线/取数失败时也能确认现在选的是哪座
+    drawCnText(8, 2, cityCurrent().name, INK_BLACK);
     drawDual(52, 22, ICONS[8].black, ICONS[8].red, 48, 48);   // 断网图标
     drawCnCenter(80, title, INK_BLACK);
     hLine(46, 105, 104, INK_BLACK);
-    drawCnCenter(116, "按任意键切换城市", INK_BLACK);
+    drawCnCenter(116, "按任意键重试", INK_BLACK);
+    if (g_batteryPct >= 0) drawBattery(146, 2, g_batteryPct); // 右上角，和天气页的日期同位置
 }
 
 /**
@@ -532,7 +570,7 @@ static bool pageProvisioning(const char* apSsid, const char* apPass) {
     QRCode qr;
     static uint8_t qrBuf[192];   // 版本 3（29x29）实际约 106 字节
     if (qrcode_initText(&qr, qrBuf, 3, 0, payload.c_str()) != 0) {
-        logLine("[QR] 内容超出版本 3 容量");
+        logLine("[QR] payload exceeds version 3 capacity");
         return false;
     }
 
@@ -550,49 +588,90 @@ static bool pageProvisioning(const char* apSsid, const char* apPass) {
                          scale, scale, INK_BLACK);
 
     drawCnCenter(132, "扫码后点加入", INK_BLACK);
-    logf("[QR] %dx%d 模块，%dpx/模块，负载 %u 字节\n",
+    logf("[QR] %dx%d modules, %dpx/module, payload %u bytes\n",
          qr.size, qr.size, scale, (unsigned)payload.length());
+    return true;
+}
+
+/**
+ * 设置页：二维码内容就是网页地址，手机扫码直接打开。
+ * 版式：标题 16px + 111px 二维码 + 底部一行（传图入口给 IP，城市入口给当前城市）。
+ * forCity 只影响标题和底注，二维码指向同一个网页，页面里两块内容都在。
+ */
+static bool pageLink(const char* url, bool forCity)
+{
+    canvasClear();
+    drawCnCenter(1, forCity ? "扫码设置城市" : "扫码传图", INK_BLACK);
+
+    QRCode qr;
+    static uint8_t qrBuf[192];
+    if (qrcode_initText(&qr, qrBuf, 3, 0, url) != 0)
+    {
+        logLine("[QR] url exceeds version 3 capacity");
+        return false;
+    }
+
+    const int scale = 3; // 3px/模块，111x111
+    const int quiet = 4; // 静区少了扫不出来
+    const int total = (qr.size + quiet * 2) * scale;
+    const int ox = (EPD_WIDTH - total) / 2;
+    const int oy = 19; // 19+111=130，给底部 IP 留 2px 间隙
+
+    fillRect(ox, oy, total, total, INK_WHITE);
+    for (uint8_t y = 0; y < qr.size; y++)
+        for (uint8_t x = 0; x < qr.size; x++)
+            if (qrcode_getModule(&qr, x, y))
+                fillRect(ox + (quiet + x) * scale, oy + (quiet + y) * scale,
+                         scale, scale, INK_BLACK);
+
+    const String ip = WiFi.localIP().toString();
+    if (forCity)
+    {
+        drawCnCenter(132, cityCurrent().name, INK_BLACK);
+    }
+    else
+    {
+        drawAsciiText((EPD_WIDTH - (int)ip.length() * 8) / 2, 132, ip.c_str(), INK_BLACK);
+    }
+    logf("[QR] %s page %s, %dx%d modules\n", forCity ? "city" : "photo", url, qr.size, qr.size);
     return true;
 }
 
 /* ============================================================================
  * 刷新与指示灯
  * ==========================================================================*/
-static uint32_t g_epdTicks = 0;     // 刷屏等待期间推进了几帧呼吸（诊断用）
+static uint32_t g_epdTicks = 0; // 刷屏等待期间推进了几帧灯（诊断用）
 
 static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
-    // 等待循环里约每 20ms 调一次，只做两件事：进入刷屏状态、推进波形。
-    // 这里不再「非刷屏就切回 WAIT」——那会让状态在 Init()/Sleep() 的等待里
-    // 被反复改写，指示灯颜色来回跳；恢复哪种颜色交给调用方决定。
-    if (refreshing) {
-        rgbSetMode(RGB_WORK);
-        g_epdTicks++;
-    }
+    // 等待循环里约每 20ms 调一次。刷屏期间不亮灯（见文件头的指示灯说明），
+    // 这里只推进波形、记一下帧数当诊断。
+    if (refreshing) g_epdTicks++;
     rgbTick();
 }
 
 /**
- * 刷屏：整个过程 15~20 秒，期间 LED 由 WaitUntilIdle 的回调持续推进波形。
- * 进入前显式切到 RGB_WORK，不依赖回调是否被调用——即使 BUSY 引脚异常、
- * 回调一帧都没跑，指示灯也至少是「红色呼吸」，不会突然变绿或熄灭。
+ * 刷屏：整个过程 15~20 秒。
+ * 进屏之前先 rgbOff()，把上一个状态（看图绿 / 配网橙）淡出掉：
+ * 刷屏本身就是最明显的进度提示，不需要再用灯重复一遍。
+ * 刷完由调用方决定要不要点亮——只有「图已经上屏」和「配网二维码就绪」
+ * 两种情况会再亮起来。
  */
 static void refreshScreen() {
-    logLine("[EPD] 刷新中 ...");
-    rgbSetMode(RGB_WORK);
+    logLine("[EPD] refreshing ...");
+    rgbOff();
     g_epdTicks = 0;
     const uint32_t t0 = millis();
     g_epd.DisplayFrame(g_black, g_red);
     const uint32_t dt = millis() - t0;
-    logf("[EPD] 完成，耗时 %lu ms，呼吸 %lu 帧\n",
+    logf("[EPD] done in %lu ms, %lu led frames\n",
          (unsigned long)dt, (unsigned long)g_epdTicks);
 }
 
 /**
- * 进入配网：开热点 -> 画二维码 -> 绿灯慢呼吸 -> 阻塞等用户保存并连接。
+ * 进入配网：开热点 -> 画二维码 -> 橙灯闪三下 -> 阻塞等用户保存并连接。
  * 连上 WiFi 后返回 true（不重启设备，避免 S2 在关射频/复位时卡死）。
  */
 static bool enterProvisioning() {
-    g_ledOffAt = 0;
     const String apSsid = defaultApSsid();
     const String apPass = AP_PASSWORD;
 
@@ -603,11 +682,13 @@ static bool enterProvisioning() {
     }
     refreshScreen();
 
-    rgbSetMode(RGB_CONFIG);          // 绿色慢呼吸：等待手机提交
+    rgbSetMode(RGB_PROV); // 橙灯闪三下：二维码已就绪（闪完自动熄）
 
-    logf("[AP] 扫码或访问 http://%s ，热点 %s\n",
+    logf("[AP] open http://%s  or join AP %s\n",
          WiFi.softAPIP().toString().c_str(), apSsid.c_str());
-    return runProvisioning();        // 连上后返回，不重启
+    const bool ok = runProvisioning(); // 连上后返回，不重启
+    rgbOff(); // 配网结束，橙色淡出，别把灯带进天气页
+    return ok;
 }
 
 /* ============================================================================
@@ -635,40 +716,52 @@ static bool ensureWiFi() {
     if (WiFi.status() == WL_CONNECTED) return true;
     String ssid, pass;
     if (!loadWifiCreds(ssid, pass)) {
-        logLine("[WiFi] 无凭据，进入配网");
+        logLine("[WiFi] no credentials, start provisioning");
         return enterProvisioning();
     }
     return connectWiFi(ssid, pass);
 }
 
+/**
+ * 屏上现在画的是不是照片。
+ * 注意它和 g_mode 不是一回事：传完图后仍停在 UI_LINK（网页继续开着，
+ * 手机可以接着传下一张），但屏上已经是照片了。KEY2 的语义取决于「看到什么」，
+ * 而不是「后台还开着什么」，所以单独记一个。
+ */
+static bool g_showingPhoto = false;
+
 /** 绘制当前页面并刷屏，然后排下一次定时刷新 */
 static void drawAndRefresh() {
     char hhmm[8];
     formatClock(hhmm, sizeof(hhmm));
-    logf("[UI] 绘制页面，时间 %s\n", hhmm);
+    logf("[UI] draw page, time %s\n", hhmm);
+
+    // 电池：每次画页前采一次（约 100ms）。放在这里而不是 refreshAll()，
+    // 是因为 setup() 开机时直接调本函数，不走 refreshAll——放那儿会漏掉开机那一次。
+    int adcMv = 0;
+    g_batteryMv = batteryMilliVolts(&adcMv);
+    g_batteryPct = batteryPercent(g_batteryMv);
+    logf("[BAT] adc %d mV -> %d mV (full %d), %d%%\n",
+         adcMv, g_batteryMv, batteryFullMilliVolts(), g_batteryPct);
 
     if (g_weather.valid) pageWeather(g_weather);
     else                 pageNoNet("无网络");
     refreshScreen();
-
-    // 刷完给个「完成」提示：绿灯浅呼吸 2.5s，由 loop() 到点熄灭
-    if (g_weather.valid) ledConfirm();
-    else                 rgbOff();
+    g_showingPhoto = false; // 屏上是天气页（或断网页）
 
     const uint32_t wait = msToNextQuarter();
     g_nextRefreshMs = millis() + wait;
     g_planValid = true;
-    logf("[PLAN] 下次刷新 %lu 秒后\n", (unsigned long)(wait / 1000));
+    logf("[PLAN] next refresh in %lu s\n", (unsigned long)(wait / 1000));
 }
 
 /**
  * 整屏刷新：联网 -> 对时 -> 拉天气 -> 绘制 -> 刷屏。
- * 现在只有 15 分钟定时器会调它（按键已空实现）；forceNet=true 是先断开再重连，
- * 目前没有调用方，留给以后的手动重连用。
+ * 调用方：15 分钟定时器、手机改完城市、从看图页退回天气页。
+ * forceNet=true 是先断开再重连，目前没有调用方，留给以后的手动重连用。
  * 天气拉取失败保留上一份数据，不会把已有页面变成错误页。
  */
 static void refreshAll(bool forceNet) {
-    g_ledOffAt = 0;                  // 取消上一次「完成」提示的待熄灭
     if (forceNet) {
         WiFi.disconnect(true, false);
         delay(200);
@@ -676,23 +769,100 @@ static void refreshAll(bool forceNet) {
 
     const bool online = ensureWiFi();
     if (online) {
-        rgbSetMode(RGB_WAIT);        // 对时 / 取天气期间蓝色慢呼吸
         if (!clockValid()) {
             startClockSync();
-            logf("[NTP] 对时%s\n", waitClock(6000) ? "成功" : "超时");
+            logf("[NTP] sync %s\n", waitClock(6000) ? "ok" : "timeout");
         }
         Weather w = g_weather;
         if (fetchWeather(w)) g_weather = w;
-        else                 logLine("[HTTP] 本次未取到天气，保留上一份");
+        else
+            logLine("[HTTP] fetch failed, keep previous weather");
     } else {
-        logLine("[WiFi] 离线，只刷新本地时间");
+        logLine("[WiFi] offline, refresh local clock only");
     }
 
     drawAndRefresh();
 }
 
 /* ============================================================================
- * 按键：短按切城市 / 长按重连
+ * 看图 / 传图 / 设城市
+ * ----------------------------------------------------------------------------
+ * 三个界面，靠 g_mode 区分：
+ *   UI_WEATHER  天气页，15 分钟定时刷新
+ *   UI_LINK     设置页：起网页 + 屏上二维码，手机可以选城市，也可以传图
+ *   UI_PHOTO    重放页：把 Flash 里存的上一次传的图刷上去，不联网
+ * 后两个界面都暂停定时刷新（照片要一直留着）。退出：KEY1 再长按，
+ * 或者 KEY2 长按（屏上是照片时它就是「回天气」，不做无谓重刷）。
+ * 手机选完城市会 POST 回来，这里等响应发完（约 1.2 秒）再回天气页刷新。
+ * ==========================================================================*/
+enum UiMode : uint8_t { UI_WEATHER = 0, UI_LINK, UI_PHOTO };
+
+static UiMode g_mode = UI_WEATHER;
+
+/** 打开设置页：连 WiFi -> 起网页 -> 屏上二维码。forCity 只决定标题与页面落点 */
+static void enterLinkMode(bool forCity)
+{
+    logf("[UI] open settings page: %s\n", forCity ? "city" : "photo");
+    g_showingPhoto = false; // 待会画的是二维码页（连不上就是断网页）
+
+    if (!ensureWiFi())
+    {
+        logLine("[LINK] no network, cannot open settings page");
+        pageNoNet("无网络");
+        refreshScreen();
+        g_mode = UI_WEATHER; // 失败就当没进去，下次再按
+        return;
+    }
+
+    if (!photoServerStart())
+    {
+        logLine("[LINK] web server failed to start");
+        pageNoNet("无网络");
+        refreshScreen();
+        g_mode = UI_WEATHER;
+        return;
+    }
+
+    const String url = photoServerUrl(forCity);
+    if (!pageLink(url.c_str(), forCity)) pageNoNet("无网络");
+    refreshScreen(); // 刷完不点灯：二维码页不用颜色提示
+
+    g_mode = UI_LINK;
+    g_planValid = false; // 暂停 15 分钟定时刷新
+    logf("[LINK] scan or open %s  (long-press KEY1 to exit)\n", url.c_str());
+}
+
+/** 长按 KEY2：把 Flash 里的上一张刷上去；没有就退回设置页 */
+static void showLastPhoto()
+{
+    logLine("[UI] KEY2 long press: replay last photo");
+    if (!photoStoreLoad(g_black, g_red))
+    {
+        logLine("[PHOTO] no stored photo, open upload page instead");
+        if (g_mode != UI_LINK) enterLinkMode(false);
+        return;
+    }
+
+    if (g_mode == UI_LINK) photoServerStop(); // 看图不必开着网页
+    refreshScreen();
+    g_showingPhoto = true;
+    g_mode = UI_PHOTO;
+    g_planValid = false;
+    rgbSetMode(RGB_OK); // 绿灯闪三下：图已经上屏（闪完自动熄）
+    logLine("[PHOTO] last photo shown (long-press KEY2 to exit)");
+}
+
+/** 长按「进来的那个键」：停掉网页，回天气页并重排定时刷新 */
+static void exitToWeather()
+{
+    logLine("[UI] long press: back to weather page");
+    if (g_mode == UI_LINK) photoServerStop();
+    g_mode = UI_WEATHER;
+    refreshAll(false); // 回天气页，并重排下一次定时刷新
+}
+
+/* ============================================================================
+ * 按键：短按开设置页选城市 / 长按进出传图
  * 消抖 + 长短按识别在这里，动作在 handleButtons() 里派发
  * ==========================================================================*/
 enum BtnEvent { BTN_NONE = 0, BTN_SHORT, BTN_LONG };
@@ -738,28 +908,32 @@ static BtnEvent pollButton(Button& b) {
 }
 
 /**
- * 按键：短按（任一键）切到下一个城市并立即刷新；长按强制重连后刷新当前城市。
- * 城市索引写 NVS，重启后仍停在上次选的城。
+ * 按键分工：
+ *   短按      = 开设置页选城市（天气页才响应；设置页/看图页里短按不做事）
+ *   KEY1 长按 = 扫码传图（已在设置页时 = 退出回天气）
+ *   KEY2 长按 = 屏上正是照片时回天气，否则调出上一张（没存过图就落到扫码页）
  */
-static void cycleCity() {
-    g_cityIdx = (g_cityIdx + 1) % CITY_COUNT;
-    saveCity();
-    g_weather.valid = false;      // 先作废旧城数据，别把上海的温度挂到南京名下
-    logf("[UI] 切换城市 -> %s (%s)\n",
-         CITIES[g_cityIdx].name, CITIES[g_cityIdx].code);
-    refreshAll(false);            // 联网 -> 拉新城天气 -> 重绘
-}
-
 static void handleButtons() {
     const BtnEvent evA = pollButton(g_btnA);
     const BtnEvent evB = pollButton(g_btnB);
-    const BtnEvent ev  = (evA != BTN_NONE) ? evA : evB;
 
-    if (ev == BTN_SHORT) {
-        cycleCity();
-    } else if (ev == BTN_LONG) {
-        logLine("[UI] 长按：强制重连并刷新");
-        refreshAll(true);
+    if ((evA == BTN_SHORT || evB == BTN_SHORT) && g_mode == UI_WEATHER)
+    {
+        enterLinkMode(true);
+    }
+
+    if (evA == BTN_LONG)
+    {
+        if (g_mode == UI_LINK) exitToWeather();
+        else enterLinkMode(false);
+    }
+
+    if (evB == BTN_LONG)
+    {
+        // 正在看图（含「刚传完还留在设置页」那种）就直接回天气，
+        // 不然会把同一张图原样重刷一遍，白等 20 秒
+        if (g_showingPhoto) exitToWeather();
+        else showLastPhoto();
     }
 }
 
@@ -767,25 +941,27 @@ static void handleButtons() {
  * 主流程
  * ==========================================================================*/
 void setup() {
-    Serial.begin(115200);
-    Serial0.begin(115200);
-    delay(800);
-    rgbBegin(BOARD_RGB_PIN, BOARD_RGB_PEAK);   // 呼吸灯引擎（上电先清灯）
+    logBegin(); // release 构建（NETEINK_LOG=0）下是空语句
+#if NETEINK_LOG
+    delay(800); // 留时间给人打开串口监视器；release 不需要
+#endif
+    rgbBegin(BOARD_RGB_PIN, BOARD_RGB_PEAK); // 指示灯引擎（上电先清灯）
+    batteryBegin(); // BAT_ADC = GPIO3
 
     pinMode(PIN_BTN_A, INPUT_PULLUP);
     pinMode(PIN_BTN_B, INPUT_PULLUP);
 
-    loadCity();                     // 恢复上次选的城市（NVS），没存过就是上海
+    cityBegin(); // 恢复上次选的城市（NVS），没存过就是上海
 
     logLine("\n========================================");
-    logLine("  NetEink / 时钟 + 天气");
-    logf("  城市：%s (短按切换)\n", CITIES[g_cityIdx].name);
+    logLine("  NetEink / clock + weather");
+    logf("  city code: %lu (short press to change)\n", (unsigned long)cityCurrent().code);
     logLine("========================================");
 
     g_epd.SetBusyCallback(onBusyTick);
-    logLine("[1/5] 初始化屏幕 ...");
+    logLine("[1/5] init display ...");
     if (g_epd.Init() != 0) {
-        logLine("[EPD] 初始化失败：检查 SPI 接线 / 供电");
+        logLine("[EPD] init failed: check SPI wiring / power");
         return;
     }
 
@@ -793,62 +969,84 @@ void setup() {
     String ssid, pass;
     bool online = false;
     if (loadWifiCreds(ssid, pass)) {
-        logf("[2/5] 连接 WiFi %s ...\n", ssid.c_str());
+        logf("[2/5] connect WiFi %s ...\n", ssid.c_str());
         online = connectWiFi(ssid, pass);
     } else {
-        logLine("[2/5] 尚未配网");
+        logLine("[2/5] not provisioned yet");
     }
 
     if (!online) {
-        logLine("[2/5] 进入配网模式");
+        logLine("[2/5] enter provisioning");
         online = enterProvisioning();   // 配网成功后 WiFi 已连上
     }
 
     // 3) 对时：同步后 RTC 会自己走，之后每 15 分钟再校一次
     if (online) {
-        logLine("[3/5] NTP 对时 ...");
+        logLine("[3/5] NTP sync ...");
         startClockSync();
         if (waitClock(6000)) {
             char hhmm[8], date[8];
             formatClock(hhmm, sizeof(hhmm));
             formatDate(date, sizeof(date));
-            logf("[NTP] 当前 %s %s\n", date, hhmm);
+            logf("[NTP] now %s %s\n", date, hhmm);
         } else {
-            logLine("[NTP] 未同步，时间显示 --:--");
+            logLine("[NTP] not synced, clock shows --:--");
         }
     } else {
-        logLine("[3/5] 离线，跳过对时");
+        logLine("[3/5] offline, skip NTP");
     }
 
     // 4) 天气：失败不影响时钟，页面会退化成「无网络」
-    logLine("[4/5] 获取天气 ...");
+    logLine("[4/5] fetch weather ...");
     if (online) {
         Weather w = g_weather;
         if (fetchWeather(w)) g_weather = w;
-        else                 logLine("[HTTP] 天气获取失败");
+        else
+            logLine("[HTTP] weather fetch failed");
     }
 
     // 5) 绘制并刷新；drawAndRefresh 内部会排好下一次 15 分钟刷新
-    logLine("[5/5] 绘制并刷新 ...");
+    logLine("[5/5] draw and refresh ...");
     drawAndRefresh();
 
-    logLine("[提示] 短按切换城市，长按强制重连");
+    logLine("[TIP] short press = set city, long KEY1 = photo, long KEY2 = last photo");
 }
 
 void loop() {
-    // 呼吸灯：主循环持续推进；「刷新完成」的绿灯到点自动熄灭
-    if (g_ledOffAt && (int32_t)(millis() - g_ledOffAt) >= 0) {
-        g_ledOffAt = 0;
-        rgbOff();
-    }
+    // 指示灯：主循环持续推进，闪三次的倒计时在 rgbTick 里走
     rgbTick();
 
-    // 按键：空实现 —— 按下不做任何事，更不会刷屏
+    // 按键：短按选城市 / 长按 KEY1 扫码 / 长按 KEY2 看上一张
     handleButtons();
 
-    // 到点刷新：每 15 分钟，对齐 :00/:15/:30/:45
+    // 设置页：先伺服手机请求，再检查有没有新图或新城
+    if (g_mode == UI_LINK)
+    {
+        photoServerLoop();
+        if (photoTakeFrame(g_black, g_red))
+        {
+            logf("[PHOTO] showing photo #%u\n", (unsigned)photoFrameCount());
+            // 先存一份再刷屏：万一刷到一半断电，KEY2 还能把这张调出来
+            photoStoreSave(g_black, g_red);
+            refreshScreen();
+            g_showingPhoto = true; // 屏上已经是照片，KEY2 该回天气而不是重刷
+            photoMarkDone();
+            rgbSetMode(RGB_OK); // 绿灯闪三下：这张已经上屏
+        }
+        // 手机选完城市（或用了定位）：等响应发完，停网页、回天气页刷新城
+        if (photoCityChangeDue())
+        {
+            logLine("[LINK] city changed from phone, refresh weather page");
+            photoServerStop();
+            g_mode = UI_WEATHER;
+            g_weather.valid = false; // 作废旧城数据，别把上海的温度挂到新城名下
+            refreshAll(false);
+        }
+    }
+
+    // 到点刷新：每 15 分钟，对齐 :00/:15/:30/:45（看图/传图时暂停）
     if (g_planValid && (int32_t)(millis() - g_nextRefreshMs) >= 0) {
-        logLine("[UI] 到点：15 分钟定时刷新");
+        logLine("[UI] scheduled: 15-minute refresh");
         refreshAll(false);
     }
 

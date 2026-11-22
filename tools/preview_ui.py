@@ -11,7 +11,7 @@ import re
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-H_PATH = os.path.join(ROOT, "src", "ui_assets.h")
+H_PATH = os.path.join(ROOT, "include", "ui_assets.h")
 OUT = os.path.join(ROOT, "tools", "preview.png")
 
 W = H = 152
@@ -110,6 +110,30 @@ def asc(img, x, y, text):
         x += 8
 
 
+def asc_c(img, x, y, text, color):
+    for ch in text:
+        bmp = ASC.get(ch)
+        if bmp:
+            mono(img, x, y, bmp, 8, 16, color)
+        x += 8
+
+
+def battery(img, right, y, pct):
+    """电池图标 + 百分比，右对齐，对应 main.cpp 的 drawBattery"""
+    ink = RED if pct <= 15 else BLACK
+    txt = "%d%%" % pct
+    tw = len(txt) * 8
+    bx, by = right - tw - 6 - 20, y + 3
+    d = ImageDraw.Draw(img)
+    d.rectangle([bx, by, bx + 17, by + 9], fill=ink)
+    d.rectangle([bx + 1, by + 1, bx + 16, by + 8], fill=WHITE)
+    d.rectangle([bx + 18, by + 3, bx + 19, by + 6], fill=ink)
+    w = (14 * pct + 50) // 100
+    if w > 0:
+        d.rectangle([bx + 2, by + 2, bx + 1 + w, by + 7], fill=ink)
+    asc_c(img, right - tw, y, txt, ink)
+
+
 def big(img, x, y, value):
     if value < 0:
         ImageDraw.Draw(img).rectangle([x + 2, y + 22, x + 17, y + 25], fill=BLACK)
@@ -135,7 +159,7 @@ def hline(img, x0, x1, y):
 
 
 def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30", icon=0,
-                 city="上海"):
+                 city="上海", batt=78):
     img = canvas()
     cn(img, 8, 2, city)
     asc(img, W - 8 - 40, 2, date)
@@ -147,6 +171,8 @@ def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30
     end = big(img, tx, 52, temp)
     ring(img, end + 8, 61, 4)
     cn(img, 10 + 24 - len(wtype) * 8, 104, wtype)
+    if batt >= 0:
+        battery(img, 146, 104, batt)
     hline(img, 6, W - 7, 124)
     cn(img, 10, 130, "最高")
     num = str(high)
@@ -159,7 +185,7 @@ def page_weather(temp=6, high=12, low=5, wtype="晴", date="11/22", clock="14:30
     return img
 
 
-def page_nonet(title="无网络", city="上海"):
+def page_nonet(title="无网络", city="上海", batt=78):
     img = canvas()
     cn(img, 8, 2, city)
     b, r = ICONS["NONET"]
@@ -167,8 +193,10 @@ def page_nonet(title="无网络", city="上海"):
     w = len(title) * 16
     cn(img, (W - w) // 2, 80, title)
     hline(img, 46, 105, 104)
-    w = len("按任意键切换城市") * 16
-    cn(img, (W - w) // 2, 116, "按任意键切换城市")
+    w = len("按任意键重试") * 16
+    cn(img, (W - w) // 2, 116, "按任意键重试")
+    if batt >= 0:
+        battery(img, 146, 2, batt)
     return img
 
 
@@ -199,6 +227,39 @@ def page_provisioning(ap_ssid="NetEink-A1B2", ap_pass="12345678"):
     return img
 
 
+def page_link(ip="192.168.1.23", for_city=False, city="上海"):
+    """设置页：标题 + 网址二维码 + 底部（城市名 / IP），对应 main.cpp 的 pageLink"""
+    img = canvas()
+    title = "扫码设置城市" if for_city else "扫码传图"
+    w = len(title) * 16
+    cn(img, (W - w) // 2, 1, title)
+    try:
+        import segno
+        url = "http://%s/" % ip + ("#city" if for_city else "")
+        qr = segno.make(url, version=3, error="l", boost_error=False)
+        matrix = qr.matrix
+    except Exception as e:
+        print("segno 不可用:", e)
+        return img
+    scale, quiet = 3, 4
+    n = len(matrix)
+    total = (n + quiet * 2) * scale
+    ox, oy = (W - total) // 2, 19
+    d = ImageDraw.Draw(img)
+    for y in range(n):
+        for x in range(n):
+            if matrix[y][x]:
+                d.rectangle([ox + (quiet + x) * scale, oy + (quiet + y) * scale,
+                             ox + (quiet + x + 1) * scale - 1,
+                             oy + (quiet + y + 1) * scale - 1], fill=BLACK)
+    if for_city:
+        cw = len(city) * 16
+        cn(img, (W - cw) // 2, 132, city)
+    else:
+        asc(img, (W - len(ip) * 8) // 2, 132, ip)
+    return img
+
+
 def main():
     items = [
         ("weather 上海 6deg sunny", page_weather(6, 12, 5, "晴", "11/22", "08:15", 0, "上海")),
@@ -206,9 +267,12 @@ def main():
         ("weather 西宁 3deg overcast", page_weather(3, 9, -1, "阴", "11/22", "19:05", 2, "西宁")),
         ("weather 深圳 26deg rain", page_weather(26, 29, 22, "小雨", "11/22", "21:45", 3, "深圳")),
         ("weather 玉树 -8deg snow", page_weather(-8, 2, -14, "小雪", "11/22", "23:10", 4, "玉树")),
+        ("weather 上海 5% battery", page_weather(6, 12, 5, "晴", "11/22", "08:15", 0, "上海", 5)),
         ("no network", page_nonet("无网络", "上海")),
         ("fetch failed", page_nonet("获取失败", "南京")),
         ("provisioning qr", page_provisioning()),
+        ("photo upload qr", page_link()),
+        ("city qr", page_link(for_city=True, city="上海")),
     ]
 
     cols, scale, gap, label_h = 3, 2, 14, 22

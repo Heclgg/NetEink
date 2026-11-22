@@ -1,0 +1,20 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+# 2 MB flash layout (W25Q16JV on this board).
+#
+# app0 is 1.75 MB instead of the 1.25 MB used by Arduino's minimal.csv:
+# that table hands 640 KB to spiffs, but only the first 64 KB is ever used
+# (src/photo_store.cpp keeps 8 slots of 8 KB for the last photo). The spare
+# 512 KB now belongs to the app.
+#
+# spiffs therefore starts at 0x1D0000 instead of 0x150000: photos stored with
+# the old layout are lost (just upload a new one). WiFi credentials live in
+# nvs at 0x9000 and are unaffected.
+#
+# Keep this file ASCII-only: PlatformIO reads it with the system locale
+# (GBK on Chinese Windows) and any non-ASCII byte fails the build with
+# "UnicodeDecodeError". Chinese notes belong in platformio.ini instead.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x1C0000,
+spiffs,   data, spiffs,  0x1D0000, 0x20000,
+coredump, data, coredump,0x1F0000, 0x10000,
