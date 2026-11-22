@@ -54,6 +54,9 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+
 #include "epd1in54c.h"
 #include "log.h"
 #include "ui_assets.h"
@@ -730,6 +733,19 @@ static bool ensureWiFi() {
  */
 static bool g_showingPhoto = false;
 
+/* ============================================================================
+ * 低功耗计时：任何按键、任何一次刷屏都算「有操作」
+ * ==========================================================================*/
+#define IDLE_SLEEP_MS   60000UL
+
+static uint32_t g_lastActiveMs = 0; // 最后一次「有操作」的时刻
+
+/** 摸一下：按键、刷屏都算有操作，重置空闲计时 */
+static void touchActivity()
+{
+    g_lastActiveMs = millis();
+}
+
 /** 绘制当前页面并刷屏，然后排下一次定时刷新 */
 static void drawAndRefresh() {
     char hhmm[8];
@@ -753,6 +769,7 @@ static void drawAndRefresh() {
     g_nextRefreshMs = millis() + wait;
     g_planValid = true;
     logf("[PLAN] next refresh in %lu s\n", (unsigned long)(wait / 1000));
+    touchActivity(); // 刚刷完，给 1 分钟操作窗口
 }
 
 /**
@@ -848,6 +865,7 @@ static void showLastPhoto()
     g_showingPhoto = true;
     g_mode = UI_PHOTO;
     g_planValid = false;
+    touchActivity(); // 刚上屏，给 1 分钟操作窗口
     rgbSetMode(RGB_OK); // 绿灯闪三下：图已经上屏（闪完自动熄）
     logLine("[PHOTO] last photo shown (long-press KEY2 to exit)");
 }
@@ -935,6 +953,67 @@ static void handleButtons() {
         if (g_showingPhoto) exitToWeather();
         else showLastPhoto();
     }
+
+    if (evA != BTN_NONE || evB != BTN_NONE) touchActivity();
+}
+
+/* ============================================================================
+ * 低功耗：空闲 1 分钟进深睡
+ * ----------------------------------------------------------------------------
+ *   天气页：定时唤醒（对齐下一个整刻）+ 按键唤醒，醒来重新联网刷天气
+ *   看图页：只等按键唤醒 —— 照片是墨水屏，断电也留着，正好当相框
+ *   设置页：不睡 —— 网页服务一睡就断，手机那边会莫名打不开
+ * 深睡丢 RAM，所以每次醒来都是一次完整重启：setup 重跑、屏幕重刷。
+ * 代价是每次刷新多花 3~5 秒重连 WiFi + 对时，换来其余时间 20µA 级的待机。
+ * ==========================================================================*/
+/** 进入深睡，不返回 */
+static void enterDeepSleep()
+{
+    // 有人正按着键就先别睡：否则一躺下就被这个按键立刻叫醒
+    if (digitalRead(PIN_BTN_A) == LOW || digitalRead(PIN_BTN_B) == LOW)
+    {
+        touchActivity();
+        return;
+    }
+
+    const bool photoMode = (g_mode == UI_PHOTO);
+
+    uint32_t waitMs = 0;
+    if (!photoMode)
+    {
+        waitMs = msToNextQuarter();
+        if (waitMs < 60000UL) waitMs = 60000UL; // 别刚躺下又爬起来
+    }
+
+    logf("[PWR] idle %lu s, deep sleep (%s)\n",
+         (unsigned long)((millis() - g_lastActiveMs) / 1000),
+         photoMode ? "key wake only" : "key or timer wake");
+    if (!photoMode)
+        logf("[PWR] timer wake in %lu s\n", (unsigned long)(waitMs / 1000));
+
+    if (g_mode == UI_LINK) photoServerStop(); // 正常进不来，保险
+    g_epd.Sleep(); // 面板断电，画面留着
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    // 两个按键都配成 RTC 上拉，任意一个拉低就醒。
+    // RTC 外设域要单独保持供电，否则内部上拉跟着掉电，引脚浮空会乱醒。
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    for (int pin : {PIN_BTN_A, PIN_BTN_B})
+    {
+        rtc_gpio_pulldown_dis((gpio_num_t)pin);
+        rtc_gpio_pullup_en((gpio_num_t)pin);
+    }
+    const uint64_t mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+    esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    if (!photoMode) esp_sleep_enable_timer_wakeup((uint64_t)waitMs * 1000ULL);
+
+    // 指示灯数据脚深睡时是悬空的，可能被干扰出随机颜色；吊住低电平
+    gpio_hold_en((gpio_num_t)BOARD_RGB_PIN);
+    gpio_deep_sleep_hold_en();
+
+    delay(60); // 让串口把上面几行吐完
+    esp_deep_sleep_start();
 }
 
 /* ============================================================================
@@ -948,8 +1027,23 @@ void setup() {
     rgbBegin(BOARD_RGB_PIN, BOARD_RGB_PEAK); // 指示灯引擎（上电先清灯）
     batteryBegin(); // BAT_ADC = GPIO3
 
+    // 解除深睡时对指示灯引脚的吊住（见 enterDeepSleep）
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)BOARD_RGB_PIN);
+
+    // 深睡前把按键配成了 RTC 上拉，醒来先还回普通 GPIO，否则 digitalRead 读不到
+    rtc_gpio_deinit((gpio_num_t)PIN_BTN_A);
+    rtc_gpio_deinit((gpio_num_t)PIN_BTN_B);
     pinMode(PIN_BTN_A, INPUT_PULLUP);
     pinMode(PIN_BTN_B, INPUT_PULLUP);
+
+    const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+    if (wake == ESP_SLEEP_WAKEUP_TIMER)
+        logLine("[PWR] wake by timer");
+    else if (wake == ESP_SLEEP_WAKEUP_EXT1)
+        logLine("[PWR] wake by key");
+    else
+        logLine("[PWR] cold boot");
 
     cityBegin(); // 恢复上次选的城市（NVS），没存过就是上海
 
@@ -1048,6 +1142,12 @@ void loop() {
     if (g_planValid && (int32_t)(millis() - g_nextRefreshMs) >= 0) {
         logLine("[UI] scheduled: 15-minute refresh");
         refreshAll(false);
+    }
+
+    // 空闲超时 -> 深睡。设置页不睡（网页服务一睡就断）
+    if (g_mode != UI_LINK && (uint32_t)(millis() - g_lastActiveMs) >= IDLE_SLEEP_MS)
+    {
+        enterDeepSleep();
     }
 
     delay(5);
