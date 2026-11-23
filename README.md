@@ -289,13 +289,14 @@ partitions.csv      2MB 分区表（app 1.75MB / spiffs 128KB）
 
 ### 二次开发
 
-| 想改什么          | 怎么做                                                                       |
-|-------------------|------------------------------------------------------------------------------|
-| 加中文字 / 换图标 | 改 `tools/gen_ui_assets.py` 的 `CN_CHARS` 或图标资源，重跑脚本               |
-| 加城市 / 改坐标   | 改 `tools/data/cities.json`，跑 `python tools/gen_cities.py`                 |
-| 改排版            | 改 `src/main.cpp` 的 `pageWeather()`，跑 `python tools/preview_ui.py` 看效果 |
-| 改网页            | 改 `src/photo_server.cpp` 里的 `PAGE_HTML`（PROGMEM 字符串）                 |
-| 改刷新周期        | `REFRESH_MINUTES`（默认 15，会重新对齐整刻）                                 |
+| 想改什么          | 怎么做                                                                                                                     |
+|-------------------|----------------------------------------------------------------------------------------------------------------------------|
+| 加中文字 / 换图标 | 改 `tools/gen_ui_assets.py` 的 `CN_CHARS` 或图标资源，重跑脚本                                                             |
+| 加城市 / 改坐标   | 改 `tools/data/cities.json`，跑 `python tools/gen_cities.py`                                                               |
+| 改排版            | 改 `src/main.cpp` 的 `pageWeather()`，跑 `python tools/preview_ui.py` 看效果                                               |
+| 改网页            | 改 `src/photo_server.cpp` 里的 `PAGE_HTML`（PROGMEM 字符串）                                                               |
+| 改刷新周期        | `REFRESH_MINUTES`（默认 15，会重新对齐整刻）                                                                               |
+| 屏幕方向          | `src/main.cpp` 的 `EPD_ROTATE_180`：1 = 旋转 180°（默认，适应倒装），0 = 正装。翻转是在送屏前对帧缓冲做的，UI 和照片一起转 |
 
 > ⚠️ `partitions.csv` 必须保持**纯 ASCII**。PlatformIO 用系统默认编码读它（中文 Windows 是 GBK），写中文注释会直接
 > `UnicodeDecodeError`。中文说明写在 `platformio.ini` 里。

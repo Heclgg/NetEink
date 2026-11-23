@@ -51,7 +51,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <math.h>
 #include <string.h>
 #include <time.h>
 #include "esp_sleep.h"
@@ -119,7 +118,8 @@ static Epd g_epd;
 
 enum Ink : uint8_t { INK_WHITE = 0, INK_BLACK = 1, INK_RED = 2 };
 
-static void canvasClear() {
+static void canvasClear()
+{
     // 这块屏的极性：位=1 表示「不着色」，0 才着色
     //   白 = (1,1)   黑 = (0,1)   红 = (1,0)
     // 依据 lib/EPD1in54C/src/imagedata.cpp 的示例图：两层的背景都是 0xFF。
@@ -127,35 +127,88 @@ static void canvasClear() {
     memset(g_red, 0xFF, sizeof(g_red));
 }
 
-static inline void putPixel(int x, int y, Ink ink) {
+/**
+ * 屏幕装成 180° 了：在整个帧缓冲送屏之前统一翻一次，绘制代码不用动。
+ * 改成 0 就是正装。
+ */
+#define EPD_ROTATE_180  1
+
+/** 单字节按位翻转（0b1101_0000 -> 0b0000_1011） */
+static inline uint8_t reverseBits(uint8_t b)
+{
+    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+    return b;
+}
+
+/**
+ * 整帧 180° 旋转（原地）。
+ * 152 是 8 的倍数（19 字节一行），所以一次旋转 = 行序倒置 + 每字节按位反转。
+ * 只动内存，和面板寄存器无关；UI 和上传的照片走的是同一份缓冲，一起转。
+ */
+static void rotate180(uint8_t* buf)
+{
+    constexpr int rb = EPD_WIDTH / 8;
+    for (int top = 0, bot = EPD_HEIGHT - 1; top < bot; top++, bot--)
+    {
+        uint8_t* a = buf + top * rb;
+        uint8_t* b = buf + bot * rb;
+        for (int i = 0; i < rb; i++)
+        {
+            const uint8_t ta = reverseBits(a[i]);
+            a[i] = reverseBits(b[rb - 1 - i]);
+            b[rb - 1 - i] = ta;
+        }
+    }
+}
+
+static inline void putPixel(int x, int y, Ink ink)
+{
     if ((unsigned)x >= (unsigned)EPD_WIDTH || (unsigned)y >= (unsigned)EPD_HEIGHT) return;
     const int idx = y * (EPD_WIDTH / 8) + (x >> 3);
     const uint8_t mask = 0x80 >> (x & 7);
-    if (ink == INK_BLACK) {           // 黑 = (0,1)
+    if (ink == INK_BLACK)
+    {
+        // 黑 = (0,1)
         g_black[idx] &= ~mask;
         g_red[idx] |= mask;
-    } else if (ink == INK_RED) {      // 红 = (1,0)
+    }
+    else if (ink == INK_RED)
+    {
+        // 红 = (1,0)
         g_black[idx] |= mask;
         g_red[idx] &= ~mask;
-    } else {                           // 白 = (1,1)
+    }
+    else
+    {
+        // 白 = (1,1)
         g_black[idx] |= mask;
         g_red[idx] |= mask;
     }
 }
 
-static void fillRect(int x, int y, int w, int h, Ink ink) {
+static void fillRect(int x, int y, int w, int h, Ink ink)
+{
     for (int j = 0; j < h; j++)
         for (int i = 0; i < w; i++)
             putPixel(x + i, y + j, ink);
 }
 
-static void hLine(int x0, int x1, int y, Ink ink) {
-    if (x1 < x0) { int t = x0; x0 = x1; x1 = t; }
+static void hLine(int x0, int x1, int y, Ink ink)
+{
+    if (x1 < x0)
+    {
+        int t = x0;
+        x0 = x1;
+        x1 = t;
+    }
     for (int x = x0; x <= x1; x++) putPixel(x, y, ink);
 }
 
 /** 画单色 1-bit 位图（字模） */
-static void drawMono(int x, int y, const uint8_t* bmp, int w, int h, Ink ink) {
+static void drawMono(int x, int y, const uint8_t* bmp, int w, int h, Ink ink)
+{
     const int rowBytes = (w + 7) / 8;
     for (int row = 0; row < h; row++)
         for (int col = 0; col < w; col++)
@@ -164,24 +217,30 @@ static void drawMono(int x, int y, const uint8_t* bmp, int w, int h, Ink ink) {
 }
 
 /** 画双色位图（图标 / 照片）：黑层优先，其次红层，其余留白 */
-static void drawDual(int x, int y, const uint8_t* black, const uint8_t* red, int w, int h) {
+static void drawDual(int x, int y, const uint8_t* black, const uint8_t* red, int w, int h)
+{
     const int rowBytes = (w + 7) / 8;
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w; col++) {
+    for (int row = 0; row < h; row++)
+    {
+        for (int col = 0; col < w; col++)
+        {
             const int idx = row * rowBytes + (col >> 3);
             const uint8_t mask = 0x80 >> (col & 7);
-            if (black[idx] & mask)      putPixel(x + col, y + row, INK_BLACK);
-            else if (red[idx] & mask)   putPixel(x + col, y + row, INK_RED);
-            else                        putPixel(x + col, y + row, INK_WHITE);
+            if (black[idx] & mask) putPixel(x + col, y + row, INK_BLACK);
+            else if (red[idx] & mask) putPixel(x + col, y + row, INK_RED);
+            else putPixel(x + col, y + row, INK_WHITE);
         }
     }
 }
 
 /** 空心圆环，用于画温度单位 ° */
-static void strokeCircle(int cx, int cy, int r, int thick, Ink ink) {
-    for (int a = 0; a < 720; a++) {
-        const float rad = a * 0.00872665f;   // 2*PI/720
-        for (int t = 0; t < thick; t++) {
+static void strokeCircle(int cx, int cy, int r, int thick, Ink ink)
+{
+    for (int a = 0; a < 720; a++)
+    {
+        const float rad = a * 0.00872665f; // 2*PI/720
+        for (int t = 0; t < thick; t++)
+        {
             putPixel(cx + (int)((r + t) * cosf(rad)),
                      cy + (int)((r + t) * sinf(rad)), ink);
         }
@@ -191,50 +250,63 @@ static void strokeCircle(int cx, int cy, int r, int thick, Ink ink) {
 /* ============================================================================
  * 文字：16x16 中文 + 8x16 ASCII + 32x48 大号数字
  * ==========================================================================*/
-static int utf8Len(unsigned char c) {
+static int utf8Len(unsigned char c)
+{
     if (c < 0x80) return 1;
     if ((c & 0xE0) == 0xC0) return 2;
     if ((c & 0xF0) == 0xE0) return 3;
     return 4;
 }
 
-static const uint8_t* findCn(const char* utf8) {
+static const uint8_t* findCn(const char* utf8)
+{
     for (int i = 0; i < CN_GLYPH_COUNT; i++)
         if (strcmp(CN_GLYPHS[i].utf8, utf8) == 0) return CN_GLYPHS[i].bmp;
     return nullptr;
 }
 
-static int cnWidth(const char* s) {
+static int cnWidth(const char* s)
+{
     int n = 0;
-    while (*s) { s += utf8Len((unsigned char)*s); n++; }
+    while (*s)
+    {
+        s += utf8Len((unsigned char)*s);
+        n++;
+    }
     return n * 16;
 }
 
-static void drawCnText(int x, int y, const char* s, Ink ink) {
-    while (*s) {
+static void drawCnText(int x, int y, const char* s, Ink ink)
+{
+    while (*s)
+    {
         const int n = utf8Len((unsigned char)*s);
         char ch[5] = {0};
         memcpy(ch, s, n);
         const uint8_t* bmp = findCn(ch);
         if (bmp) drawMono(x, y, bmp, 16, 16, ink);
-        else     fillRect(x + 2, y + 2, 12, 12, ink);   // 缺字：画方块提示
+        else fillRect(x + 2, y + 2, 12, 12, ink); // 缺字：画方块提示
         x += 16;
         s += n;
     }
 }
 
-static void drawCnCenter(int y, const char* s, Ink ink) {
+static void drawCnCenter(int y, const char* s, Ink ink)
+{
     drawCnText((EPD_WIDTH - cnWidth(s)) / 2, y, s, ink);
 }
 
-static const uint8_t* findAscii(char c) {
+static const uint8_t* findAscii(char c)
+{
     for (int i = 0; i < ASCII_GLYPH_COUNT; i++)
         if (ASCII_GLYPHS[i].ch == c) return ASCII_GLYPHS[i].bmp;
     return nullptr;
 }
 
-static void drawAsciiText(int x, int y, const char* s, Ink ink) {
-    while (*s) {
+static void drawAsciiText(int x, int y, const char* s, Ink ink)
+{
+    while (*s)
+    {
         const uint8_t* bmp = findAscii(*s);
         if (bmp) drawMono(x, y, bmp, 8, 16, ink);
         x += 8;
@@ -243,15 +315,18 @@ static void drawAsciiText(int x, int y, const char* s, Ink ink) {
 }
 
 /** 32x48 大号数字，返回绘制结束的 x 坐标 */
-static int drawBigNumber(int x, int y, int value, Ink ink) {
-    if (value < 0) {
-        fillRect(x + 2, y + 22, 16, 4, ink);   // 负号
+static int drawBigNumber(int x, int y, int value, Ink ink)
+{
+    if (value < 0)
+    {
+        fillRect(x + 2, y + 22, 16, 4, ink); // 负号
         x += 20;
         value = -value;
     }
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", value);
-    for (char* p = buf; *p; p++) {
+    for (char* p = buf; *p; p++)
+    {
         if (*p >= '0' && *p <= '9')
             drawMono(x, y, BIG_DIGITS[*p - '0'], BIG_DIGIT_W, BIG_DIGIT_H, ink);
         x += BIG_DIGIT_W;
@@ -260,17 +335,20 @@ static int drawBigNumber(int x, int y, int value, Ink ink) {
 }
 
 /** 16x24 时钟数字（顶部 HH:MM），缺字画短横占位 */
-static const uint8_t* findClock(char c) {
+static const uint8_t* findClock(char c)
+{
     for (int i = 0; i < CLOCK_GLYPH_COUNT; i++)
         if (CLOCK_GLYPHS[i].ch == c) return CLOCK_GLYPHS[i].bmp;
     return nullptr;
 }
 
-static void drawClockText(int x, int y, const char* s, Ink ink) {
-    while (*s) {
+static void drawClockText(int x, int y, const char* s, Ink ink)
+{
+    while (*s)
+    {
         const uint8_t* bmp = findClock(*s);
         if (bmp) drawMono(x, y, bmp, CLOCK_W, CLOCK_H, ink);
-        else     fillRect(x + 4, y + 9, 8, 6, ink);
+        else fillRect(x + 4, y + 9, 8, 6, ink);
         x += CLOCK_W;
         s++;
     }
@@ -280,25 +358,34 @@ static void drawClockText(int x, int y, const char* s, Ink ink) {
  * 时间：NTP 对时 + 本地时间格式化
  * 时区固定中国标准时间（UTC+8、无夏令时），POSIX TZ 字符串写 "CST-8"。
  * ==========================================================================*/
-static bool clockValid() {
-    return time(nullptr) > 1600000000;    // 晚于 2020-09-13 才认为已同步
+static bool clockValid()
+{
+    return time(nullptr) > 1600000000; // 晚于 2020-09-13 才认为已同步
 }
 
-static void startClockSync() {
+static void startClockSync()
+{
     configTzTime("CST-8", "ntp.aliyun.com", "ntp.ntsc.ac.cn", "pool.ntp.org");
 }
 
-static bool waitClock(uint32_t timeoutMs) {
+static bool waitClock(uint32_t timeoutMs)
+{
     const uint32_t t0 = millis();
-    while (!clockValid() && millis() - t0 < timeoutMs) {
+    while (!clockValid() && millis() - t0 < timeoutMs)
+    {
         rgbTick(); // 对时要等好几秒，灯的倒计时要继续走
         delay(20);
     }
     return clockValid();
 }
 
-static bool formatClock(char* out, size_t n) {
-    if (!clockValid()) { snprintf(out, n, "--:--"); return false; }
+static bool formatClock(char* out, size_t n)
+{
+    if (!clockValid())
+    {
+        snprintf(out, n, "--:--");
+        return false;
+    }
     time_t now = time(nullptr);
     struct tm tmv;
     localtime_r(&now, &tmv);
@@ -306,8 +393,13 @@ static bool formatClock(char* out, size_t n) {
     return true;
 }
 
-static void formatDate(char* out, size_t n) {
-    if (!clockValid()) { snprintf(out, n, "--/--"); return; }
+static void formatDate(char* out, size_t n)
+{
+    if (!clockValid())
+    {
+        snprintf(out, n, "--/--");
+        return;
+    }
     time_t now = time(nullptr);
     struct tm tmv;
     localtime_r(&now, &tmv);
@@ -322,17 +414,19 @@ static void formatDate(char* out, size_t n) {
 /* ============================================================================
  * 天气数据
  * ==========================================================================*/
-struct Weather {
+struct Weather
+{
     bool valid = false;
-    int  temp  = 0;
-    int  high  = 0;
-    int  low   = 0;
+    int temp = 0;
+    int high = 0;
+    int low = 0;
     char city[16] = "上海";
     char type[24] = "多云";
-    char date[8]  = "--/--";
+    char date[8] = "--/--";
 };
 
-static bool extractQuoted(const String& s, const char* key, char* out, size_t n, int from = 0) {
+static bool extractQuoted(const String& s, const char* key, char* out, size_t n, int from = 0)
+{
     String pat = String("\"") + key + "\":\"";
     int i = s.indexOf(pat, from);
     if (i < 0) return false;
@@ -344,7 +438,8 @@ static bool extractQuoted(const String& s, const char* key, char* out, size_t n,
     return true;
 }
 
-static int firstInt(const char* s) {
+static int firstInt(const char* s)
+{
     while (*s && *s != '-' && (*s < '0' || *s > '9')) s++;
     return atoi(s);
 }
@@ -372,7 +467,8 @@ static const char* weatherEn(const char* type)
 }
 #endif
 
-static bool connectWiFi(const String& ssid, const String& pass) {
+static bool connectWiFi(const String& ssid, const String& pass)
+{
     logf("[WiFi] connecting %s ...\n", ssid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), pass.c_str());
@@ -380,12 +476,14 @@ static bool connectWiFi(const String& ssid, const String& pass) {
     // 联网期间不亮灯（只在配网就绪/图已上屏这两个时刻闪三下），rgbTick 仍要推，
     // 否则从配网橙色退出时会卡在半亮
     const uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS)
+    {
         rgbTick();
         delay(10);
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED)
+    {
         logf("[WiFi] connected %s  RSSI=%d\n",
              WiFi.localIP().toString().c_str(), WiFi.RSSI());
         return true;
@@ -394,7 +492,8 @@ static bool connectWiFi(const String& ssid, const String& pass) {
     return false;
 }
 
-static bool fetchWeather(Weather& w) {
+static bool fetchWeather(Weather& w)
+{
     const CityRec& city = cityCurrent();
     char url[80];
     snprintf(url, sizeof(url), WEATHER_BASE "%09lu", (unsigned long)city.code);
@@ -403,13 +502,15 @@ static bool fetchWeather(Weather& w) {
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setConnectTimeout(HTTP_TIMEOUT_MS);
-    if (!http.begin(url)) {
+    if (!http.begin(url))
+    {
         logLine("[HTTP] begin failed");
         return false;
     }
 
     const int code = http.GET();
-    if (code != 200) {
+    if (code != 200)
+    {
         logf("[HTTP] status %d\n", code);
         http.end();
         return false;
@@ -423,7 +524,8 @@ static bool fetchWeather(Weather& w) {
     char buf[64];
 
     // 当前温度 "wendu":"5.5"
-    if (extractQuoted(body, "wendu", buf, sizeof(buf))) {
+    if (extractQuoted(body, "wendu", buf, sizeof(buf)))
+    {
         w.temp = (int)lroundf(atof(buf));
     }
 
@@ -431,18 +533,22 @@ static bool fetchWeather(Weather& w) {
     const int fc = body.indexOf("\"forecast\":[");
     if (fc < 0) return false;
 
-    if (extractQuoted(body, "type", w.type, sizeof(w.type), fc)) {
+    if (extractQuoted(body, "type", w.type, sizeof(w.type), fc))
+    {
         logf("[HTTP] weather %s\n", weatherEn(w.type));
     }
-    if (extractQuoted(body, "high", buf, sizeof(buf), fc)) {
+    if (extractQuoted(body, "high", buf, sizeof(buf), fc))
+    {
         w.high = firstInt(buf);
     }
-    if (extractQuoted(body, "low", buf, sizeof(buf), fc)) {
+    if (extractQuoted(body, "low", buf, sizeof(buf), fc))
+    {
         w.low = firstInt(buf);
     }
 
     // 顶层 "date":"20261120" -> 11/20
-    if (extractQuoted(body, "date", buf, sizeof(buf)) && strlen(buf) >= 8) {
+    if (extractQuoted(body, "date", buf, sizeof(buf)) && strlen(buf) >= 8)
+    {
         snprintf(w.date, sizeof(w.date), "%c%c/%c%c", buf[4], buf[5], buf[6], buf[7]);
     }
 
@@ -454,13 +560,15 @@ static bool fetchWeather(Weather& w) {
 }
 
 /** 把中文天气映射到 9 个图标之一 */
-static int pickIcon(const char* type) {
+static int pickIcon(const char* type)
+{
     if (strstr(type, "雷")) return 6;
     if (strstr(type, "雪")) return 4;
     if (strstr(type, "雨")) return 3;
     if (strstr(type, "雾") || strstr(type, "霾")) return 5;
     if (strstr(type, "风") || strstr(type, "沙") ||
-        strstr(type, "尘") || strstr(type, "扬")) return 7;
+        strstr(type, "尘") || strstr(type, "扬"))
+        return 7;
     if (strstr(type, "阴")) return 2;
     if (strstr(type, "多云")) return 1;
     if (strstr(type, "晴")) return 0;
@@ -500,7 +608,8 @@ static void drawBattery(int right, int y, int pct)
     drawAsciiText(right - tw, y, txt, ink);
 }
 
-static void pageWeather(const Weather& w) {
+static void pageWeather(const Weather& w)
+{
     canvasClear();
 
     // 顶部：城市 + 日期（日期取本地时间，与时钟同源，不依赖天气接口）
@@ -523,7 +632,7 @@ static void pageWeather(const Weather& w) {
     // 右侧大号温度：2 位数/负数从 x=66 起，1 位数从 x=80 起，视觉居中
     const int tempX = (w.temp >= 10 || w.temp <= -10) ? 66 : 80;
     const int endX = drawBigNumber(tempX, 52, w.temp, INK_BLACK);
-    strokeCircle(endX + 8, 61, 4, 1, INK_BLACK);   // 温度单位 °
+    strokeCircle(endX + 8, 61, 4, 1, INK_BLACK); // 温度单位 °
 
     // 天气文字放在图标正下方，与图标成一组
     drawCnText(10 + 24 - cnWidth(w.type) / 2, 104, w.type, INK_BLACK);
@@ -548,11 +657,12 @@ static void pageWeather(const Weather& w) {
     strokeCircle(lx + (int)strlen(num) * 8 + 6, 135, 3, 1, INK_BLACK);
 }
 
-static void pageNoNet(const char* title) {
+static void pageNoNet(const char* title)
+{
     canvasClear();
     // 顶部照旧显示当前城市：离线/取数失败时也能确认现在选的是哪座
     drawCnText(8, 2, cityCurrent().name, INK_BLACK);
-    drawDual(52, 22, ICONS[8].black, ICONS[8].red, 48, 48);   // 断网图标
+    drawDual(52, 22, ICONS[8].black, ICONS[8].red, 48, 48); // 断网图标
     drawCnCenter(80, title, INK_BLACK);
     hLine(46, 105, 104, INK_BLACK);
     drawCnCenter(116, "按任意键重试", INK_BLACK);
@@ -564,26 +674,28 @@ static void pageNoNet(const char* title) {
  * 二维码内容是 WiFi 配置格式（WIFI:T:WPA;S:...;P:...;;），
  * 手机扫码会直接连上设备热点，再由 captive portal 自动弹出配置页。
  */
-static bool pageProvisioning(const char* apSsid, const char* apPass) {
+static bool pageProvisioning(const char* apSsid, const char* apPass)
+{
     canvasClear();
     drawCnCenter(1, "扫码配网", INK_BLACK);
 
     const String payload = String("WIFI:T:WPA;S:") + apSsid + ";P:" + apPass + ";;";
 
     QRCode qr;
-    static uint8_t qrBuf[192];   // 版本 3（29x29）实际约 106 字节
-    if (qrcode_initText(&qr, qrBuf, 3, 0, payload.c_str()) != 0) {
+    static uint8_t qrBuf[192]; // 版本 3（29x29）实际约 106 字节
+    if (qrcode_initText(&qr, qrBuf, 3, 0, payload.c_str()) != 0)
+    {
         logLine("[QR] payload exceeds version 3 capacity");
         return false;
     }
 
-    const int scale = 3;          // 3px/模块，整体 111x111，152 屏放得下且能扫
-    const int quiet = 4;          // 静区 4 模块，少了扫不出来
+    const int scale = 3; // 3px/模块，整体 111x111，152 屏放得下且能扫
+    const int quiet = 4; // 静区 4 模块，少了扫不出来
     const int total = (qr.size + quiet * 2) * scale;
     const int ox = (EPD_WIDTH - total) / 2;
     const int oy = 19;
 
-    fillRect(ox, oy, total, total, INK_WHITE);   // 静区必须是白的
+    fillRect(ox, oy, total, total, INK_WHITE); // 静区必须是白的
     for (uint8_t y = 0; y < qr.size; y++)
         for (uint8_t x = 0; x < qr.size; x++)
             if (qrcode_getModule(&qr, x, y))
@@ -646,7 +758,8 @@ static bool pageLink(const char* url, bool forCity)
 static bool g_epdAsleep = false; // 面板已下电（刷完就关，见 refreshScreen）
 static uint32_t g_epdTicks = 0; // 刷屏等待期间推进了几帧灯（诊断用）
 
-static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
+static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing)
+{
     // 等待循环里约每 20ms 调一次。刷屏期间不亮灯（见文件头的指示灯说明），
     // 这里只推进波形、记一下帧数当诊断。
     if (refreshing) g_epdTicks++;
@@ -660,7 +773,8 @@ static void onBusyTick(unsigned long /*elapsed_ms*/, bool refreshing) {
  * 刷完由调用方决定要不要点亮——只有「图已经上屏」和「配网二维码就绪」
  * 两种情况会再亮起来。
  */
-static void refreshScreen() {
+static void refreshScreen()
+{
     logLine("[EPD] refreshing ...");
     rgbOff();
 
@@ -675,6 +789,13 @@ static void refreshScreen() {
 
     g_epdTicks = 0;
     const uint32_t t0 = millis();
+
+#if EPD_ROTATE_180
+    // 翻转是原地做的，所以必须赶在 DisplayFrame 之前、照片存盘之后
+    rotate180(g_black);
+    rotate180(g_red);
+#endif
+
     g_epd.DisplayFrame(g_black, g_red);
 
     // 刷完立刻下电（POWER_OFF + VCOM 归零）。
@@ -693,13 +814,15 @@ static void refreshScreen() {
  * 进入配网：开热点 -> 画二维码 -> 橙灯闪三下 -> 阻塞等用户保存并连接。
  * 连上 WiFi 后返回 true（不重启设备，避免 S2 在关射频/复位时卡死）。
  */
-static bool enterProvisioning() {
+static bool enterProvisioning()
+{
     const String apSsid = defaultApSsid();
     const String apPass = AP_PASSWORD;
 
     startProvisioning(apSsid, apPass);
 
-    if (!pageProvisioning(apSsid.c_str(), apPass.c_str())) {
+    if (!pageProvisioning(apSsid.c_str(), apPass.c_str()))
+    {
         pageNoNet("配网失败");
     }
     refreshScreen();
@@ -718,26 +841,29 @@ static bool enterProvisioning() {
  * 三色屏全刷约 20 秒且会闪屏，分钟级刷新不现实；对齐到 :00/:15/:30/:45
  * 后，屏上时间正好是整齐的刻钟，也避免固定间隔累积漂移。
  * ==========================================================================*/
-static Weather  g_weather;         // 全局天气缓存：刷新失败时保留上一份
+static Weather g_weather; // 全局天气缓存：刷新失败时保留上一份
 #define REFRESH_MINUTES   15
 static uint32_t g_nextRefreshMs = 0;
-static bool     g_planValid = false;
+static bool g_planValid = false;
 
-static uint32_t msToNextQuarter() {
+static uint32_t msToNextQuarter()
+{
     if (!clockValid()) return REFRESH_MINUTES * 60UL * 1000UL;
     time_t now = time(nullptr);
     struct tm tmv;
     localtime_r(&now, &tmv);
     const int into = (tmv.tm_min % REFRESH_MINUTES) * 60 + tmv.tm_sec;
     uint32_t wait = (uint32_t)(REFRESH_MINUTES * 60 - into) * 1000UL;
-    return wait < 3000 ? 3000 : wait;      // 贴着整刻时别马上又刷一遍
+    return wait < 3000 ? 3000 : wait; // 贴着整刻时别马上又刷一遍
 }
 
 /** 有凭据就重连，没凭据/连不上就进配网；返回 WiFi 是否可用 */
-static bool ensureWiFi() {
+static bool ensureWiFi()
+{
     if (WiFi.status() == WL_CONNECTED) return true;
     String ssid, pass;
-    if (!loadWifiCreds(ssid, pass)) {
+    if (!loadWifiCreds(ssid, pass))
+    {
         logLine("[WiFi] no credentials, start provisioning");
         return enterProvisioning();
     }
@@ -766,7 +892,8 @@ static void touchActivity()
 }
 
 /** 绘制当前页面并刷屏，然后排下一次定时刷新 */
-static void drawAndRefresh() {
+static void drawAndRefresh()
+{
     char hhmm[8];
     formatClock(hhmm, sizeof(hhmm));
     logf("[UI] draw page, time %s\n", hhmm);
@@ -780,7 +907,7 @@ static void drawAndRefresh() {
          adcMv, g_batteryMv, batteryFullMilliVolts(), g_batteryPct);
 
     if (g_weather.valid) pageWeather(g_weather);
-    else                 pageNoNet("无网络");
+    else pageNoNet("无网络");
     refreshScreen();
     g_showingPhoto = false; // 屏上是天气页（或断网页）
 
@@ -797,15 +924,19 @@ static void drawAndRefresh() {
  * forceNet=true 是先断开再重连，目前没有调用方，留给以后的手动重连用。
  * 天气拉取失败保留上一份数据，不会把已有页面变成错误页。
  */
-static void refreshAll(bool forceNet) {
-    if (forceNet) {
+static void refreshAll(bool forceNet)
+{
+    if (forceNet)
+    {
         WiFi.disconnect(true, false);
         delay(200);
     }
 
     const bool online = ensureWiFi();
-    if (online) {
-        if (!clockValid()) {
+    if (online)
+    {
+        if (!clockValid())
+        {
             startClockSync();
             logf("[NTP] sync %s\n", waitClock(6000) ? "ok" : "timeout");
         }
@@ -813,7 +944,9 @@ static void refreshAll(bool forceNet) {
         if (fetchWeather(w)) g_weather = w;
         else
             logLine("[HTTP] fetch failed, keep previous weather");
-    } else {
+    }
+    else
+    {
         logLine("[WiFi] offline, refresh local clock only");
     }
 
@@ -904,31 +1037,42 @@ static void exitToWeather()
  * ==========================================================================*/
 enum BtnEvent { BTN_NONE = 0, BTN_SHORT, BTN_LONG };
 
-struct Button {
-    uint8_t  pin;
-    bool     stable;
-    bool     raw;
+struct Button
+{
+    uint8_t pin;
+    bool stable;
+    bool raw;
     uint32_t lastChange;
     uint32_t pressStart;
-    bool     longSent;
+    bool longSent;
 };
 
 static Button g_btnA = {PIN_BTN_A, true, true, 0, 0, false};
 static Button g_btnB = {PIN_BTN_B, true, true, 0, 0, false};
 
-static BtnEvent pollButton(Button& b) {
-    const bool raw = digitalRead(b.pin);        // 低 = 按下
+static BtnEvent pollButton(Button& b)
+{
+    const bool raw = digitalRead(b.pin); // 低 = 按下
     const uint32_t now = millis();
 
-    if (raw != b.raw) { b.raw = raw; b.lastChange = now; return BTN_NONE; }
+    if (raw != b.raw)
+    {
+        b.raw = raw;
+        b.lastChange = now;
+        return BTN_NONE;
+    }
     if (now - b.lastChange < DEBOUNCE_MS) return BTN_NONE;
 
-    if (raw != b.stable) {
+    if (raw != b.stable)
+    {
         b.stable = raw;
-        if (raw == LOW) {
+        if (raw == LOW)
+        {
             b.pressStart = now;
             b.longSent = false;
-        } else {
+        }
+        else
+        {
             const bool wasShort = (b.pressStart != 0) && !b.longSent;
             b.pressStart = 0;
             if (wasShort) return BTN_SHORT;
@@ -937,7 +1081,8 @@ static BtnEvent pollButton(Button& b) {
     }
 
     if (b.stable == LOW && !b.longSent && b.pressStart != 0 &&
-        now - b.pressStart >= LONG_PRESS_MS) {
+        now - b.pressStart >= LONG_PRESS_MS)
+    {
         b.longSent = true;
         return BTN_LONG;
     }
@@ -950,7 +1095,8 @@ static BtnEvent pollButton(Button& b) {
  *   KEY1 长按 = 扫码传图（已在设置页时 = 退出回天气）
  *   KEY2 长按 = 屏上正是照片时回天气，否则调出上一张（没存过图就落到扫码页）
  */
-static void handleButtons() {
+static void handleButtons()
+{
     const BtnEvent evA = pollButton(g_btnA);
     const BtnEvent evB = pollButton(g_btnB);
 
@@ -1043,7 +1189,8 @@ static void enterDeepSleep()
 /* ============================================================================
  * 主流程
  * ==========================================================================*/
-void setup() {
+void setup()
+{
     logBegin(); // release 构建（NETEINK_LOG=0）下是空语句
 #if NETEINK_LOG
     delay(800); // 留时间给人打开串口监视器；release 不需要
@@ -1078,7 +1225,8 @@ void setup() {
 
     g_epd.SetBusyCallback(onBusyTick);
     logLine("[1/5] init display ...");
-    if (g_epd.Init() != 0) {
+    if (g_epd.Init() != 0)
+    {
         logLine("[EPD] init failed: check SPI wiring / power");
         return;
     }
@@ -1087,37 +1235,48 @@ void setup() {
     // 2) 有凭据就联网；没配过网或连不上 -> 进配网（内部阻塞，连上后返回）
     String ssid, pass;
     bool online = false;
-    if (loadWifiCreds(ssid, pass)) {
+    if (loadWifiCreds(ssid, pass))
+    {
         logf("[2/5] connect WiFi %s ...\n", ssid.c_str());
         online = connectWiFi(ssid, pass);
-    } else {
+    }
+    else
+    {
         logLine("[2/5] not provisioned yet");
     }
 
-    if (!online) {
+    if (!online)
+    {
         logLine("[2/5] enter provisioning");
-        online = enterProvisioning();   // 配网成功后 WiFi 已连上
+        online = enterProvisioning(); // 配网成功后 WiFi 已连上
     }
 
     // 3) 对时：同步后 RTC 会自己走，之后每 15 分钟再校一次
-    if (online) {
+    if (online)
+    {
         logLine("[3/5] NTP sync ...");
         startClockSync();
-        if (waitClock(6000)) {
+        if (waitClock(6000))
+        {
             char hhmm[8], date[8];
             formatClock(hhmm, sizeof(hhmm));
             formatDate(date, sizeof(date));
             logf("[NTP] now %s %s\n", date, hhmm);
-        } else {
+        }
+        else
+        {
             logLine("[NTP] not synced, clock shows --:--");
         }
-    } else {
+    }
+    else
+    {
         logLine("[3/5] offline, skip NTP");
     }
 
     // 4) 天气：失败不影响时钟，页面会退化成「无网络」
     logLine("[4/5] fetch weather ...");
-    if (online) {
+    if (online)
+    {
         Weather w = g_weather;
         if (fetchWeather(w)) g_weather = w;
         else
@@ -1131,7 +1290,8 @@ void setup() {
     logLine("[TIP] short press = set city, long KEY1 = photo, long KEY2 = last photo");
 }
 
-void loop() {
+void loop()
+{
     // 指示灯：主循环持续推进，闪三次的倒计时在 rgbTick 里走
     rgbTick();
 
@@ -1164,7 +1324,8 @@ void loop() {
     }
 
     // 到点刷新：每 15 分钟，对齐 :00/:15/:30/:45（看图/传图时暂停）
-    if (g_planValid && (int32_t)(millis() - g_nextRefreshMs) >= 0) {
+    if (g_planValid && (int32_t)(millis() - g_nextRefreshMs) >= 0)
+    {
         logLine("[UI] scheduled: 15-minute refresh");
         refreshAll(false);
     }
